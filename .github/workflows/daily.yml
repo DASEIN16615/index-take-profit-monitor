@@ -1,0 +1,19 @@
+name: index-take-profit-monitor
+
+on:
+  # 由 Cloudflare Worker cron 触发(可靠),GitHub schedule 已移除(免费计划会延迟/跳过)
+  workflow_dispatch: {}
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run index monitor
+        run: python index_monitor.py
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_CODE: ${{ secrets.SMTP_CODE }}

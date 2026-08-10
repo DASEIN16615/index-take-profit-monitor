@@ -1,0 +1,7 @@
+name = "index-monitor-trigger"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+# 工作日(周一~周五)UTC 01:00 = 北京时间 09:00
+[triggers]
+crons = ["0 1 * * 1-5"]
