@@ -358,7 +358,7 @@ def send_email(text_body, html_body, subject):
             s.sendmail(user, [to], msg.as_string())
         return True
     except Exception as e:
-        log(f"邮件发送失败: {e}")
+        print(f"❌ 邮件发送失败: {type(e).__name__}: {e}")
         return False
 
 
@@ -676,7 +676,7 @@ def main():
         email_html,
         subject,
     )
-    log(f"邮件推送: {'成功' if sent else '未配置/跳过'}")
+    print(f"📬 邮件推送结果: {'✅ 成功送达 smtp.qq.com' if sent else '❌ 未送达/发送失败'}")
     return 0
 
 
