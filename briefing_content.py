@@ -51,11 +51,13 @@ def translate_to_zh(text):
 
 # ==================== 1. 宏观资产数据 (全中文标签与单位) ====================
 def fetch_macro_tickers():
-    """抓取 10年期美债收益率、黄金期货、半导体ETF"""
+    """抓取纳斯达克100、标普500昨夜涨跌幅及全球宏观风向标"""
     targets = [
+        {"symbol": "^NDX", "name": "纳斯达克100 (昨夜)", "unit": " 点"},
+        {"symbol": "^GSPC", "name": "标普500指数 (昨夜)", "unit": " 点"},
+        {"symbol": "SOXX", "name": "费城半导体 ETF", "unit": " 美元"},
         {"symbol": "^TNX", "name": "10年期美债收益率", "unit": "%"},
         {"symbol": "GC=F", "name": "COMEX 黄金期货", "unit": " 美元/盎司"},
-        {"symbol": "SOXX", "name": "费城半导体 ETF", "unit": " 美元"},
     ]
     results = []
     for t in targets:
@@ -238,7 +240,7 @@ def render_full_briefing_html(rows, any_alert, macro_tickers, ai_news, macro_new
             if "美债" in m["name"]:
                 chg_color = "#3b82f6"
             badges.append(f"""
-            <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 8px 12px; min-width: 140px; box-sizing: border-box; margin: 4px;">
+            <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 8px 12px; min-width: 110px; flex: 1 1 110px; box-sizing: border-box; margin: 4px;">
                 <div style="font-size: 11px; color: #64748b; font-weight: 600;">{m['name']}</div>
                 <div style="font-size: 14px; font-weight: 700; color: #0f172a; margin-top: 2px;">{m['price']}</div>
                 <div style="font-size: 11px; font-weight: 600; color: {chg_color}; margin-top: 1px;">{m['chg_str']}</div>
@@ -247,7 +249,7 @@ def render_full_briefing_html(rows, any_alert, macro_tickers, ai_news, macro_new
         macro_html = f"""
         <div style="margin-bottom: 20px;">
             <div style="font-size: 12px; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px;">
-                🌐 全球宏观核心风向标
+                🌐 全球宏观核心风向标 (含昨夜美股与关键资产)
             </div>
             <div style="display: flex; flex-wrap: wrap; margin: -4px;">
                 {''.join(badges)}
