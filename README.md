@@ -8,8 +8,8 @@
 ## 🏛️ 系统架构 (Serverless 闭环)
 
 ```
-Cloudflare Workers Cron (工作日 08:30 / 09:00 北京时间定时触发)
-   ↓ 调用 GitHub Actions Dispatch API (免费云端算力)
+GitHub Actions Schedule (每日 09:00 北京时间 / UTC 01:00 定时触发)
+   ↓ 自动运行工作流
 GitHub Actions 执行 index_monitor.py + briefing_content.py
    ├─ ① 资产双轴层: 纳指100 / 标普500 / 沪深300 / 中证500 (PE/PB/分位/SMA200)
    ├─ ② 宏观指标层: 10年期美债收益率 (^TNX) / COMEX黄金 (GC=F) / 费城半导体 (SOXX)

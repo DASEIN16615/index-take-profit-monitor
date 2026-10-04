@@ -432,7 +432,7 @@ def render_full_briefing_html(rows, any_alert, macro_tickers, ai_news, macro_new
             
             <!-- 底部声明与署名 -->
             <div style="background: #f8fafc; border-top: 1px solid #e2e8f0; padding: 18px 28px; text-align: center; font-size: 11px; color: #94a3b8; line-height: 1.6;">
-                Cloudflare Workers Cron 触发 · GitHub Actions 云端运算 · 自动化情报推送<br>
+                GitHub Actions Schedule · 每日 09:00 (UTC+8) 自动化情报推送<br>
                 推送目标：2158793923@qq.com · 专属系统工程内参
             </div>
             

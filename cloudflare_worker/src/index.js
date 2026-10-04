@@ -1,5 +1,5 @@
 export default {
-  // 定时触发:工作日 UTC 01:00 = 北京 09:00
+  // 定时触发: 每日 UTC 01:00 = 北京 09:00
   async scheduled(event, env, ctx) {
     return dispatch(env);
   },
