@@ -42,6 +42,11 @@ try:
 except Exception:
     pass
 
+try:
+    import briefing_content
+except ImportError:
+    briefing_content = None
+
 CN_TZ = timezone(timedelta(hours=8))
 US_TZ_EDT = timezone(timedelta(hours=-4))
 
@@ -645,11 +650,31 @@ def main():
 
     report = "\n".join(lines)
     print(report)
-    # 邮件推送:HTML + 纯文本双格式
+    # 晨间综合情报拓展模块
+    macro_tickers, ai_news, macro_news, eco_reading = [], [], [], None
+    if briefing_content:
+        try:
+            log("正在抓取宏观快照、AI科技论文、全球政经要闻与经济学人精读...")
+            macro_tickers = briefing_content.fetch_macro_tickers()
+            ai_news = briefing_content.fetch_ai_briefing(limit=3)
+            macro_news = briefing_content.fetch_macro_news(limit=3)
+            eco_reading = briefing_content.get_daily_economist_reading(now)
+        except Exception as e:
+            log(f"情报模块抓取异常 (已降级): {e}")
+
+    if briefing_content and eco_reading:
+        email_html = briefing_content.render_full_briefing_html(
+            rows, any_tp, macro_tickers, ai_news, macro_news, eco_reading, now
+        )
+    else:
+        email_html = build_email_html(rows, any_tp, now)
+
+    # 邮件推送: HTML + 纯文本双格式
+    subject = f"DASEIN 晨间情报内参 {now:%m-%d} {'🚨有止盈信号' if any_tp else '双轴健康'}"
     sent = send_email(
         build_email_text(rows, any_tp, now),
-        build_email_html(rows, any_tp, now),
-        f"指数监控 {now:%m-%d} {'🚨有止盈信号' if any_tp else '正常'}",
+        email_html,
+        subject,
     )
     log(f"邮件推送: {'成功' if sent else '未配置/跳过'}")
     return 0
