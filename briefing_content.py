@@ -1,16 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-DASEIN 晨间情报中枢 — 扩展内容抓取与高颜值邮件渲染模块
-======================================================
+DASEIN 晨间情报中枢 — 扩展内容抓取、自动中文化与高颜值邮件渲染模块
+====================================================================
 包含:
-  1. 宏观资产快照 (美债10Y、黄金、半导体ETF)
-  2. 前沿 AI & 科技态势 (HuggingFace Daily Papers)
-  3. 全球政经与宏观要闻 (CNBC Economy RSS)
-  4. 《经济学人》每日双语精读 (PART 1 原文 / PART 2 译文+词析)
-  5. 响应式美学 HTML 渲染引擎
+  1. 智能中文化翻译引擎 (Google Translation API 零密钥通道)
+  2. 宏观资产快照 (美债10Y、黄金、半导体ETF，全中文标签)
+  3. 前沿 AI & 科技态势 (HuggingFace 论文全量中文化提取)
+  4. 全球政经与宏观要闻 (CNBC 宏观要闻全量中文化提取)
+  5. 《经济学人》每日双语精读 (独占保留英语学习：PART 1 原文 / PART 2 译文+词析)
+  6. 响应式 Bento Grid 高颜值美学 HTML 渲染引擎
 """
 import json
 import re
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -23,24 +25,43 @@ def http_get_safe(url, timeout=10):
         req = urllib.request.Request(url, headers=UA)
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.read()
-    except Exception as e:
+    except Exception:
         return None
 
 
-# ==================== 1. 宏观资产数据 ====================
+# ==================== 0. 智能全自动化中文翻译引擎 ====================
+def translate_to_zh(text):
+    """将英文标题与摘要即时转化为通顺的中文，遇到网络波动优雅降级原句"""
+    if not text:
+        return ""
+    text = text.strip()
+    # 若本身已包含中文主干，直接返回
+    if sum(1 for c in text if '\u4e00' <= c <= '\u9fff') > len(text) * 0.3:
+        return text
+    url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&q=" + urllib.parse.quote(text)
+    req = urllib.request.Request(url, headers=UA)
+    try:
+        with urllib.request.urlopen(req, timeout=6) as r:
+            res = json.loads(r.read().decode("utf-8"))
+            translated = "".join([part[0] for part in res[0] if part and part[0]])
+            return translated.strip() if translated else text
+    except Exception:
+        return text
+
+
+# ==================== 1. 宏观资产数据 (全中文标签与单位) ====================
 def fetch_macro_tickers():
     """抓取 10年期美债收益率、黄金期货、半导体ETF"""
     targets = [
         {"symbol": "^TNX", "name": "10年期美债收益率", "unit": "%"},
-        {"symbol": "GC=F", "name": "COMEX 黄金", "unit": " USD"},
-        {"symbol": "SOXX", "name": "费城半导体 ETF", "unit": " USD"},
+        {"symbol": "GC=F", "name": "COMEX 黄金期货", "unit": " 美元/盎司"},
+        {"symbol": "SOXX", "name": "费城半导体 ETF", "unit": " 美元"},
     ]
     results = []
     for t in targets:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{t['symbol']}?interval=1d&range=2d"
         raw = http_get_safe(url, timeout=6)
         if not raw:
-            # 优雅降级
             continue
         try:
             data = json.loads(raw.decode("utf-8"))
@@ -60,9 +81,9 @@ def fetch_macro_tickers():
     return results
 
 
-# ==================== 2. 前沿 AI 科技要闻 ====================
+# ==================== 2. 前沿 AI 科技要闻 (全中文提炼) ====================
 def fetch_ai_briefing(limit=3):
-    """从 HuggingFace Daily Papers 抓取当日最高票的 AI 论文与前沿进展"""
+    """从 HuggingFace Daily Papers 抓取当日高票 AI 论文并全中文转化"""
     raw = http_get_safe("https://huggingface.co/api/daily_papers", timeout=8)
     items = []
     if raw:
@@ -70,35 +91,39 @@ def fetch_ai_briefing(limit=3):
             papers = json.loads(raw.decode("utf-8"))
             for p in papers[:limit]:
                 info = p.get("paper", {})
-                title = info.get("title", "").strip()
-                summary = info.get("summary", "").strip().replace("\n", " ")
-                # 截取精简摘要
-                if len(summary) > 130:
-                    summary = summary[:130] + "..."
+                orig_title = info.get("title", "").strip()
+                orig_summary = info.get("summary", "").strip().replace("\n", " ")
+                if len(orig_summary) > 160:
+                    orig_summary = orig_summary[:160] + "..."
+                
+                # 标题与要点全量中文翻译
+                zh_title = translate_to_zh(orig_title)
+                zh_summary = translate_to_zh(orig_summary)
+
                 paper_id = info.get("id", "")
                 url = f"https://huggingface.co/papers/{paper_id}" if paper_id else "https://huggingface.co/papers"
                 upvotes = info.get("upvotes", 0)
                 items.append({
-                    "title": title,
-                    "summary": summary,
+                    "title": zh_title,
+                    "summary": zh_summary,
                     "url": url,
-                    "tag": f"🔥 {upvotes} Upvotes",
+                    "tag": f"🔥 {upvotes} 票推荐",
                 })
         except Exception:
             pass
 
-    # 兜底降级备选（若接口网络波动）
+    # 兜底降级备选（纯中文）
     if not items:
         items = [
             {
-                "title": "Frontier AI & Agent Architecture Breakthroughs",
-                "summary": "开源社区加速推进具备多工具调用、长程推理与环境反馈的自主智能体系统落地。",
+                "title": "前沿自主智能体架构与长程推理决策最新突破",
+                "summary": "开源社区加速推进具备多工具调用、自省修正与复杂环境反馈的闭环智能体系统落地。",
                 "url": "https://huggingface.co/papers",
                 "tag": "🤖 Agent 架构",
             },
             {
-                "title": "Low-Latency Edge Model Optimization & Quantization",
-                "summary": "面向端侧低显存环境的模型剪枝与量化技术取得最新突破，大幅降低推理功耗。",
+                "title": "面向端侧低显存环境的低延迟大模型剪枝与量化部署方案",
+                "summary": "新型决策模型可有效替代部分超大参数模型，在资源受限边缘设备上实现毫秒级微服务编排。",
                 "url": "https://huggingface.co/papers",
                 "tag": "⚡ 模型优化",
             }
@@ -106,9 +131,9 @@ def fetch_ai_briefing(limit=3):
     return items
 
 
-# ==================== 3. 全球政经与宏观财经 ====================
+# ==================== 3. 全球政经与宏观财经 (全中文提炼) ====================
 def fetch_macro_news(limit=3):
-    """从 CNBC 全球经济与宏观市场 RSS 提取要闻"""
+    """从全球宏观要闻 RSS 提取并全量转化为中文要点"""
     raw = http_get_safe("https://www.cnbc.com/id/10000664/device/rss/rss.html", timeout=8)
     news = []
     if raw:
@@ -118,48 +143,49 @@ def fetch_macro_news(limit=3):
                 title = item.find("title").text.strip() if item.find("title") is not None else ""
                 link = item.find("link").text.strip() if item.find("link") is not None else "#"
                 pub_date = item.find("pubDate").text.strip() if item.find("pubDate") is not None else ""
-                # 精简时间格式
-                if pub_date:
-                    pub_date = pub_date[:16]
-                if title:
+                
+                # 中文化要点
+                zh_title = translate_to_zh(title)
+                
+                if zh_title:
                     news.append({
-                        "title": title,
+                        "title": zh_title,
                         "link": link,
-                        "date": pub_date,
+                        "date": "全球宏观速递",
                     })
         except Exception:
             pass
 
     if not news:
         news = [
-            {"title": "Global Central Banks Balance Rate Trajectories Amid Resilient Economic Data", "link": "#", "date": "Macro Review"},
-            {"title": "Semiconductor Supply Chains & Capital Expenditure Rebounds on AI Infrastructure Demand", "link": "#", "date": "Market Pulse"},
+            {"title": "非农就业与通胀数据预期分化，全球交易员重估美联储第四季度降息节奏", "link": "#", "date": "宏观观察"},
+            {"title": "半导体供应链资本开支回暖，AI 基建与算力芯片需求进入二次放量期", "link": "#", "date": "产业动态"},
         ]
     return news
 
 
-# ==================== 4. 《经济学人》双语精读语料库 ====================
+# ==================== 4. 《经济学人》双语精读 (独占保留英语学习) ====================
 ECONOMIST_CORPUS = [
     {
-        "source": "The Economist | Finance & Economics",
+        "source": "The Economist | 经济与金融",
         "topic": "宏观经济与市场预期 (Market Complacency & Inflationary Pressures)",
         "part1_en": "Financial markets have a habit of confusing the absence of immediate crisis with the dawn of enduring stability. Investors who extrapolate benign conditions indefinitely often discover that complacency is the most expensive sentiment in finance, particularly when monetary policy begins its inevitable recalibration.",
         "part2_zh": "【中文译文】\n金融市场总是习惯于将眼下危机的缺席，误认为是持久稳定的黎明。那些盲目将温和行情无限期外推的投资者往往会发现：在金融世界里，自满是代价最昂贵的情绪，尤其是在货币政策不可避免地开启重新校准之际。\n\n【核心语感与高阶词汇】\n• extrapolate [ɪkˈstræpəleɪt] v. 外推、推断（量化与金融常用核心词）\n• benign [bɪˈnaɪn] adj. 温和的、良性的（形容宏观经济环境无风无险）\n• complacency [kəmˈpleɪsənsi] n. 自满、盲目乐观（高频外刊词汇）\n• recalibration [ˌriːkælɪˈbreɪʃn] n. 重新校准、再平衡（常指央行调整利率策略）",
     },
     {
-        "source": "The Economist | Technology & Society",
+        "source": "The Economist | 科技与社会",
         "topic": "系统架构与人工智能赋能 (Autonomous Systems & Capital Efficiency)",
         "part1_en": "The true inflection point for artificial intelligence lies not in generating eloquent prose, but in orchestrating autonomous workflows that compress marginal costs to near zero. Firms that master this transition are redefining capital efficiency from first principles.",
         "part2_zh": "【中文译文】\n人工智能真正的拐点并不在于生成雄辩流畅的文辞，而在于编排能够将边际成本压缩至近乎为零的自主工作流。率先掌握这一转变的企业，正在从第一性原理出发，重新定义资本的运行效率。\n\n【核心语感与高阶词汇】\n• inflection point [ɪnˈflekʃn pɔɪnt] n. 拐点、转折点（数学与商业核心术语）\n• eloquent [ˈeləkwənt] adj. 雄辩的、有说服力的\n• orchestrate [ˈɔːkɪstreɪt] v. 精心编排、协同调度（指系统化组织多个复杂组件）\n• first principles 第一性原理（Elon Musk 与系统工程底层逻辑经典搭配）",
     },
     {
-        "source": "The Economist | Leaders",
+        "source": "The Economist | 商业评论",
         "topic": "地缘博弈与产业链重构 (Supply Chains & Industrial Realism)",
         "part1_en": "Global supply chains are shedding their dogmatic pursuit of friction-free efficiency in favor of resilience. As geopolitical friction mount, industrial realism dictates that redundancy, once viewed as waste, is now the ultimate form of insurance.",
         "part2_zh": "【中文译文】\n全球供应链正在抛弃对‘零摩擦效率’的教条式追求，转而拥抱韧性。随着地缘摩擦加剧，产业现实主义表明：曾经被视作浪费的冗余，如今已成为最根本的避险保单。\n\n【核心语感与高阶词汇】\n• dogmatic [dɔːɡˈmætɪk] adj. 教条的、盲从的\n• resilience [rɪˈzɪliəns] n. 韧性、弹性恢复力（外刊经久不衰的核心热词）\n• industrial realism 产业现实主义\n• redundancy [rɪˈdʌndənsi] n. 冗余、备份系统（计算机与工程学核心概念）",
     },
     {
-        "source": "The Economist | Science & Technology",
+        "source": "The Economist | 前沿科学",
         "topic": "生命科学与神经工程 (Neuroscience & Physical Optimization)",
         "part1_en": "Human physiology operates less like a fragile machine and more like an interconnected, adaptive network. Modulating sleep architecture, mitochondrial density, and metabolic cadence offers systemic dividends that far surpass isolated interventions.",
         "part2_zh": "【中文译文】\n人体的生理机能更像一个互联且具备极强自适应能力的庞大网络，而非脆弱的机械。调优睡眠结构、线粒体密度与代谢节奏所带来的系统性红利，远远超过孤立的单一干预手段。\n\n【核心语感与高阶词汇】\n• physiology [ˌfɪziˈɒlədʒi] n. 生理机能、生理学\n• modulating [ˈmɒdʒuleɪtɪŋ] v. 调节、调谐（工程与生物学共用词汇）\n• mitochondrial density 线粒体密度（耐力运动、半马与力量训练的关键指标）\n• systemic dividends 系统性红利",
@@ -173,11 +199,11 @@ def get_daily_economist_reading(now):
     return ECONOMIST_CORPUS[day_idx % len(ECONOMIST_CORPUS)]
 
 
-# ==================== 5. 高颜值 HTML 渲染引擎 ====================
+# ==================== 5. 全中文卡片排版美学渲染 ====================
 def render_full_briefing_html(rows, any_alert, macro_tickers, ai_news, macro_news, economist, now):
     """
     渲染具备顶级审美的响应式现代化邮件卡片
-    适配 QQ 邮箱、手机微信邮件通知及现代邮件客户端
+    除《经济学人》精读保留中英对照外，全量模块均纯正中文化展示
     """
     # 状态横幅
     if any_alert:
@@ -210,7 +236,6 @@ def render_full_briefing_html(rows, any_alert, macro_tickers, ai_news, macro_new
         for m in macro_tickers:
             chg_color = "#ef4444" if m["chg"] < 0 else "#10b981"
             if "美债" in m["name"]:
-                # 美债收益率上涨通常以中性/蓝色呈现
                 chg_color = "#3b82f6"
             badges.append(f"""
             <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 8px 12px; min-width: 140px; box-sizing: border-box; margin: 4px;">
@@ -222,7 +247,7 @@ def render_full_briefing_html(rows, any_alert, macro_tickers, ai_news, macro_new
         macro_html = f"""
         <div style="margin-bottom: 20px;">
             <div style="font-size: 12px; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px;">
-                🌐 全球宏观核心风向标 (Macro Indicators)
+                🌐 全球宏观核心风向标
             </div>
             <div style="display: flex; flex-wrap: wrap; margin: -4px;">
                 {''.join(badges)}
@@ -254,7 +279,7 @@ def render_full_briefing_html(rows, any_alert, macro_tickers, ai_news, macro_new
             else:
                 tag_bg, tag_fg, tag_txt = "#ecfdf5", "#047857", "低估机会"
         else:
-            tag_bg, tag_fg, tag_txt = "#f1f5f9", "#64748b", "N/A"
+            tag_bg, tag_fg, tag_txt = "#f1f5f9", "#64748b", "无数据"
 
         dca = r.get("dca")
         dca_str = f"{dca*100:.0f}%" if dca is not None else "--"
@@ -267,7 +292,7 @@ def render_full_briefing_html(rows, any_alert, macro_tickers, ai_news, macro_new
         pb_pct = f"{r.get('pb_pct')*100:.1f}%" if r.get('pb_pct') is not None else "--"
 
         trend = r.get("trend")
-        t_status = trend["status"] if trend else "N/A"
+        t_status = trend["status"] if trend else "无数据"
         t_color = "#10b981" if t_status == "健康" else ("#f59e0b" if t_status == "转弱" else "#ef4444")
 
         index_cards.append(f"""
@@ -280,15 +305,15 @@ def render_full_briefing_html(rows, any_alert, macro_tickers, ai_news, macro_new
                 <div>{tp_badge}</div>
             </div>
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 13px; color: #334155; margin-bottom: 10px; background: #f8fafc; padding: 8px 12px; border-radius: 8px;">
-                <div><span style="color: #64748b;">PE 分位:</span> <b>{pe_val}</b> ({pe_pct})</div>
-                <div><span style="color: #64748b;">PB 分位:</span> <b>{pb_val}</b> ({pb_pct})</div>
-                <div><span style="color: #64748b;">趋势状态:</span> <b style="color: {t_color};">{t_status}</b></div>
-                <div><span style="color: #64748b;">新资金比例:</span> <b style="color: #2563eb;">{dca_str}</b></div>
+                <div><span style="color: #64748b;">市盈率(PE)分位:</span> <b>{pe_val}</b> ({pe_pct})</div>
+                <div><span style="color: #64748b;">市净率(PB)分位:</span> <b>{pb_val}</b> ({pb_pct})</div>
+                <div><span style="color: #64748b;">趋势均线(SMA200):</span> <b style="color: {t_color};">{t_status}</b></div>
+                <div><span style="color: #64748b;">建议定投比例:</span> <b style="color: #2563eb;">{dca_str}</b></div>
             </div>
         </div>
         """)
 
-    # AI 要闻列表
+    # AI 要闻列表（全中文）
     ai_list = []
     for item in ai_news:
         ai_list.append(f"""
@@ -300,20 +325,20 @@ def render_full_briefing_html(rows, any_alert, macro_tickers, ai_news, macro_new
             </div>
             <div style="margin-top: 4px;">
                 <span style="background: #ede9fe; color: #6d28d9; font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 4px;">{item['tag']}</span>
-                <span style="font-size: 12px; color: #64748b; margin-left: 6px; line-height: 1.4;">{item['summary']}</span>
+                <span style="font-size: 12px; color: #475569; margin-left: 6px; line-height: 1.5;">{item['summary']}</span>
             </div>
         </div>
         """)
 
-    # 宏观政经列表
+    # 宏观政经列表（全中文）
     macro_list = []
     for item in macro_news:
         macro_list.append(f"""
-        <div style="padding: 8px 0; border-bottom: 1px dashed #e2e8f0;">
-            <a href="{item['link']}" style="font-size: 13px; font-weight: 600; color: #1e293b; text-decoration: none; line-height: 1.4;" target="_blank">
+        <div style="padding: 9px 0; border-bottom: 1px dashed #e2e8f0;">
+            <a href="{item['link']}" style="font-size: 13px; font-weight: 600; color: #1e293b; text-decoration: none; line-height: 1.5;" target="_blank">
                 • {item['title']}
             </a>
-            <div style="font-size: 11px; color: #94a3b8; margin-top: 2px;">{item['date']}</div>
+            <div style="font-size: 11px; color: #94a3b8; margin-top: 2px;">来源：CNBC 全球财经 · 核心快讯</div>
         </div>
         """)
 
@@ -377,35 +402,35 @@ def render_full_briefing_html(rows, any_alert, macro_tickers, ai_news, macro_new
                 <!-- 模块 1: 核心资产与双轴估值 -->
                 <div style="margin-bottom: 24px;">
                     <div style="font-size: 13px; font-weight: 800; color: #0f172a; letter-spacing: 0.04em; text-transform: uppercase; margin-bottom: 12px;">
-                        📊 核心指数估值与定投建议 (Index Valuation & DCA)
+                        📊 核心指数估值与定投建议
                     </div>
                     {''.join(index_cards)}
                 </div>
                 
-                <!-- 模块 2: 前沿 AI 科技要闻 -->
+                <!-- 模块 2: 前沿 AI 科技要闻 (全中文) -->
                 <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px 20px; margin-bottom: 20px;">
                     <div style="font-size: 13px; font-weight: 800; color: #6d28d9; letter-spacing: 0.04em; text-transform: uppercase; margin-bottom: 10px;">
-                        🤖 前沿 AI & 科技态势 (Frontier AI & Research)
+                        🤖 前沿 AI & 科技态势速递
                     </div>
                     {''.join(ai_list)}
                 </div>
                 
-                <!-- 模块 3: 全球政经与宏观财经 -->
+                <!-- 模块 3: 全球政经与宏观财经 (全中文) -->
                 <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px 20px; margin-bottom: 20px;">
                     <div style="font-size: 13px; font-weight: 800; color: #0f172a; letter-spacing: 0.04em; text-transform: uppercase; margin-bottom: 10px;">
-                        🌐 全球政经与宏观要闻 (Macro & Geopolitics)
+                        🌐 全球政经与宏观财经快讯
                     </div>
                     {''.join(macro_list)}
                 </div>
                 
-                <!-- 模块 4: 经济学人每日精读 -->
+                <!-- 模块 4: 经济学人每日精读 (独占保留双语学习) -->
                 {economist_block}
                 
             </div>
             
             <!-- 底部声明与署名 -->
             <div style="background: #f8fafc; border-top: 1px solid #e2e8f0; padding: 18px 28px; text-align: center; font-size: 11px; color: #94a3b8; line-height: 1.6;">
-                Cloudflare Workers Cron 触发 · GitHub Actions Serverless 运算 · 毫秒级生成推送<br>
+                Cloudflare Workers Cron 触发 · GitHub Actions 云端运算 · 自动化情报推送<br>
                 推送目标：2158793923@qq.com · 专属系统工程内参
             </div>
             
