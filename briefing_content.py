@@ -85,7 +85,7 @@ def fetch_macro_tickers():
 
 # ==================== 2. 前沿 AI 科技要闻 (全中文提炼) ====================
 def fetch_ai_briefing(limit=3):
-    """从 HuggingFace Daily Papers 抓取当日高票 AI 论文并全中文转化"""
+    """从 HuggingFace Daily Papers 抓取当日高票 AI 论文并全中文深度概括"""
     raw = http_get_safe("https://huggingface.co/api/daily_papers", timeout=8)
     items = []
     if raw:
@@ -95,12 +95,24 @@ def fetch_ai_briefing(limit=3):
                 info = p.get("paper", {})
                 orig_title = info.get("title", "").strip()
                 orig_summary = info.get("summary", "").strip().replace("\n", " ")
-                if len(orig_summary) > 160:
-                    orig_summary = orig_summary[:160] + "..."
                 
-                # 标题与要点全量中文翻译
+                # 提取前 2~3 个完整英文句子，避免半词半句生硬截断
+                sentences = [s.strip() for s in orig_summary.split(". ") if s.strip()]
+                if len(sentences) >= 2:
+                    crop_text = ". ".join(sentences[:2]) + "."
+                elif sentences:
+                    crop_text = sentences[0] + "."
+                else:
+                    crop_text = orig_summary[:320]
+                
+                if len(crop_text) > 420:
+                    crop_text = crop_text[:420]
+                
+                # 标题与要点全量中文翻译与句尾整理
                 zh_title = translate_to_zh(orig_title)
-                zh_summary = translate_to_zh(orig_summary)
+                zh_summary = translate_to_zh(crop_text).strip()
+                if zh_summary and not zh_summary.endswith(("。", "！", "？", "…", ".")):
+                    zh_summary += "。"
 
                 paper_id = info.get("id", "")
                 url = f"https://huggingface.co/papers/{paper_id}" if paper_id else "https://huggingface.co/papers"
@@ -114,18 +126,18 @@ def fetch_ai_briefing(limit=3):
         except Exception:
             pass
 
-    # 兜底降级备选（纯中文）
+    # 兜底降级备选（纯中文完整概括）
     if not items:
         items = [
             {
                 "title": "前沿自主智能体架构与长程推理决策最新突破",
-                "summary": "开源社区加速推进具备多工具调用、自省修正与复杂环境反馈的闭环智能体系统落地。",
+                "summary": "开源社区加速推进具备多工具调用、自省修正与复杂环境反馈的闭环智能体系统落地，显著提升长链路复杂任务执行成功率。",
                 "url": "https://huggingface.co/papers",
                 "tag": "🤖 Agent 架构",
             },
             {
                 "title": "面向端侧低显存环境的低延迟大模型剪枝与量化部署方案",
-                "summary": "新型决策模型可有效替代部分超大参数模型，在资源受限边缘设备上实现毫秒级微服务编排。",
+                "summary": "新型决策模型可有效替代部分超大参数模型，在资源受限边缘设备上实现毫秒级微服务编排，大幅降低端侧推理延迟与算力成本。",
                 "url": "https://huggingface.co/papers",
                 "tag": "⚡ 模型优化",
             }
@@ -315,19 +327,22 @@ def render_full_briefing_html(rows, any_alert, macro_tickers, ai_news, macro_new
         </div>
         """)
 
-    # AI 要闻列表（全中文）
+    # 科技快讯与前沿 AI 论文列表（中文概括 + 底部完整文章链接）
     ai_list = []
     for item in ai_news:
         ai_list.append(f"""
-        <div style="padding: 10px 0; border-bottom: 1px dashed #e2e8f0;">
-            <div style="display: flex; justify-content: space-between; align-items: baseline;">
-                <a href="{item['url']}" style="font-size: 14px; font-weight: 700; color: #2563eb; text-decoration: none; line-height: 1.4;" target="_blank">
+        <div style="padding: 14px 0; border-bottom: 1px dashed #e2e8f0;">
+            <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px;">
+                <div style="font-size: 14px; font-weight: 700; color: #0f172a; line-height: 1.45;">
                     {item['title']}
-                </a>
+                </div>
+                <span style="background: #ede9fe; color: #6d28d9; font-size: 10.5px; font-weight: 700; padding: 2px 7px; border-radius: 4px; white-space: nowrap; margin-left: 8px;">{item['tag']}</span>
             </div>
-            <div style="margin-top: 4px;">
-                <span style="background: #ede9fe; color: #6d28d9; font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 4px;">{item['tag']}</span>
-                <span style="font-size: 12px; color: #475569; margin-left: 6px; line-height: 1.5;">{item['summary']}</span>
+            <div style="font-size: 13px; color: #334155; line-height: 1.65; background: #f8fafc; border-left: 3px solid #8b5cf6; padding: 10px 14px; border-radius: 4px; margin-bottom: 8px;">
+                <b style="color: #6d28d9;">【中文概括】</b>{item['summary']}
+            </div>
+            <div style="font-size: 11.5px; color: #64748b; margin-top: 4px; word-break: break-all;">
+                🔗 文章链接：<a href="{item['url']}" target="_blank" style="color: #2563eb; text-decoration: underline;">{item['url']}</a>
             </div>
         </div>
         """)
@@ -409,10 +424,10 @@ def render_full_briefing_html(rows, any_alert, macro_tickers, ai_news, macro_new
                     {''.join(index_cards)}
                 </div>
                 
-                <!-- 模块 2: 前沿 AI 科技要闻 (全中文) -->
+                <!-- 模块 2: 科技快讯与前沿 AI 论文 (全中文概括 + 原文链接) -->
                 <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px 20px; margin-bottom: 20px;">
                     <div style="font-size: 13px; font-weight: 800; color: #6d28d9; letter-spacing: 0.04em; text-transform: uppercase; margin-bottom: 10px;">
-                        🤖 前沿 AI & 科技态势速递
+                        🤖 科技快讯与前沿 AI 论文速递
                     </div>
                     {''.join(ai_list)}
                 </div>
