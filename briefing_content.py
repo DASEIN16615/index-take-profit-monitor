@@ -11,6 +11,7 @@ DASEIN 晨间情报中枢 — 扩展内容抓取、自动中文化与高颜值�
   6. 响应式 Bento Grid 高颜值美学 HTML 渲染引擎
 """
 import json
+import os
 import re
 import urllib.parse
 import urllib.request
@@ -83,6 +84,51 @@ def fetch_macro_tickers():
     return results
 
 
+def summarize_papers_with_deepseek(raw_papers, api_key):
+    """使用 DeepSeek 大模型对前沿论文进行学术级中文提炼与核心方案概括"""
+    if not api_key:
+        return None
+    url = "https://api.deepseek.com/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    papers_payload = []
+    for i, p in enumerate(raw_papers):
+        papers_payload.append(f"{i+1}. 标题: {p['orig_title']}\n摘要: {p['orig_abstract']}")
+
+    prompt = (
+        "你是一位资深计算机与人工智能学者。请对以下前沿AI论文进行学术内参速递整理。\n"
+        "严格返回JSON对象格式，格式如下：{\"papers\": [{\"id\": 1, \"title\": \"中文标题\", \"summary\": \"核心概括\"}, ...]}\n"
+        "要求：\n"
+        "- title: 专业的中文标题（杜绝生硬机翻，专业术语如LLM/Agent/SFT/RL等保持行业规范）\n"
+        "- summary: 核心突破与方案概括（110~140字，重点阐述其提出了什么新架构/算法/理论，以及关键实验发现与结论，直接切入核心，坚决剔除空洞背景废话）\n\n"
+        "论文列表：\n" + "\n\n".join(papers_payload)
+    )
+
+    data = {
+        "model": "deepseek-chat",
+        "messages": [
+            {"role": "system", "content": "你是一个专门负责顶级AI论文提炼的学术助手，严格输出符合要求的JSON格式。"},
+            {"role": "user", "content": prompt}
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.2
+    }
+
+    try:
+        req = urllib.request.Request(url, data=json.dumps(data).encode("utf-8"), headers=headers)
+        with urllib.request.urlopen(req, timeout=18) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+            content = json.loads(res["choices"][0]["message"]["content"])
+            papers = content.get("papers", [])
+            if isinstance(papers, list) and papers:
+                return papers
+    except Exception:
+        pass
+    return None
+
+
 # ==================== 2. 前沿 AI 科技要闻 (全中文提炼) ====================
 def fetch_ai_briefing(limit=3):
     """从 HuggingFace Daily Papers 抓取当日高票 AI 论文并全中文深度概括"""
@@ -91,38 +137,60 @@ def fetch_ai_briefing(limit=3):
     if raw:
         try:
             papers = json.loads(raw.decode("utf-8"))
+            parsed_papers = []
             for p in papers[:limit]:
                 info = p.get("paper", {})
                 orig_title = info.get("title", "").strip()
                 orig_summary = info.get("summary", "").strip().replace("\n", " ")
-                
-                # 提取前 2~3 个完整英文句子，避免半词半句生硬截断
-                sentences = [s.strip() for s in orig_summary.split(". ") if s.strip()]
-                if len(sentences) >= 2:
-                    crop_text = ". ".join(sentences[:2]) + "."
-                elif sentences:
-                    crop_text = sentences[0] + "."
-                else:
-                    crop_text = orig_summary[:320]
-                
-                if len(crop_text) > 420:
-                    crop_text = crop_text[:420]
-                
-                # 标题与要点全量中文翻译与句尾整理
-                zh_title = translate_to_zh(orig_title)
-                zh_summary = translate_to_zh(crop_text).strip()
-                if zh_summary and not zh_summary.endswith(("。", "！", "？", "…", ".")):
-                    zh_summary += "。"
-
                 paper_id = info.get("id", "")
                 url = f"https://huggingface.co/papers/{paper_id}" if paper_id else "https://huggingface.co/papers"
                 upvotes = info.get("upvotes", 0)
-                items.append({
-                    "title": zh_title,
-                    "summary": zh_summary,
+                parsed_papers.append({
+                    "orig_title": orig_title,
+                    "orig_abstract": orig_summary,
+                    "paper_id": paper_id,
                     "url": url,
                     "tag": f"🔥 {upvotes} 票推荐",
                 })
+
+            # 优先使用 DeepSeek 大模型进行学术级提炼与深度概括
+            api_key = os.environ.get("DEEPSEEK_API_KEY")
+            ds_results = summarize_papers_with_deepseek(parsed_papers, api_key) if api_key else None
+
+            if ds_results and len(ds_results) == len(parsed_papers):
+                for raw_p, ds_p in zip(parsed_papers, ds_results):
+                    items.append({
+                        "title": ds_p.get("title") or raw_p["orig_title"],
+                        "summary": ds_p.get("summary") or "",
+                        "url": raw_p["url"],
+                        "tag": raw_p["tag"],
+                    })
+            else:
+                # 备用高质启发式提取（杜绝背景套话与法学硕士等机翻错误）
+                for p in parsed_papers:
+                    orig_summary = p["orig_abstract"]
+                    sentences = [s.strip() for s in orig_summary.split(". ") if s.strip()]
+                    contrib_sents = [s for s in sentences if any(k in s.lower() for k in ["propose", "introduce", "present", "find", "show", "across", "achieve", "demonstrate"])]
+                    if contrib_sents:
+                        crop_text = ". ".join(contrib_sents[:2]) + "."
+                    elif len(sentences) >= 2:
+                        crop_text = ". ".join(sentences[1:3]) + "."
+                    else:
+                        crop_text = orig_summary[:300]
+
+                    safe_title = p["orig_title"].replace("LLM", "大语言模型(LLM)").replace("Slop", "低质垃圾文本(Slop)")
+                    safe_crop = crop_text.replace("LLM", "大语言模型(LLM)").replace("Slop", "低质垃圾文本(Slop)")
+                    zh_title = translate_to_zh(safe_title)
+                    zh_summary = translate_to_zh(safe_crop).strip()
+                    if zh_summary and not zh_summary.endswith(("。", "！", "？", "…", ".")):
+                        zh_summary += "。"
+
+                    items.append({
+                        "title": zh_title,
+                        "summary": zh_summary,
+                        "url": p["url"],
+                        "tag": p["tag"],
+                    })
         except Exception:
             pass
 
@@ -130,14 +198,14 @@ def fetch_ai_briefing(limit=3):
     if not items:
         items = [
             {
-                "title": "前沿自主智能体架构与长程推理决策最新突破",
-                "summary": "开源社区加速推进具备多工具调用、自省修正与复杂环境反馈的闭环智能体系统落地，显著提升长链路复杂任务执行成功率。",
+                "title": "SciUtopia：学术研发生态的闭环LLM智能体仿真",
+                "summary": "提出SciUtopia，一个持久化闭环LLM智能体仿真框架，用于研究学术研发生态。在61个仿真世界中模拟8000家机构的4万余名研究者，产生约40万次发表决策与120万条同行评审。纵向仿真发现拒稿重投会显著放大审稿负担。",
                 "url": "https://huggingface.co/papers",
                 "tag": "🤖 Agent 架构",
             },
             {
-                "title": "面向端侧低显存环境的低延迟大模型剪枝与量化部署方案",
-                "summary": "新型决策模型可有效替代部分超大参数模型，在资源受限边缘设备上实现毫秒级微服务编排，大幅降低端侧推理延迟与算力成本。",
+                "title": "在策略参数更新方向是LLM后训练泛化的关键",
+                "summary": "提出OPSFT，将SFT更新约束到在策略范式识别的累积更新方向上，使SFT能迁移在策略泛化优势，大幅提升分布外推理能力，为SFT与RL的融合提供全新视角。",
                 "url": "https://huggingface.co/papers",
                 "tag": "⚡ 模型优化",
             }
@@ -339,7 +407,7 @@ def render_full_briefing_html(rows, any_alert, macro_tickers, ai_news, macro_new
                 <span style="background: #ede9fe; color: #6d28d9; font-size: 10.5px; font-weight: 700; padding: 2px 7px; border-radius: 4px; white-space: nowrap; margin-left: 8px;">{item['tag']}</span>
             </div>
             <div style="font-size: 13px; color: #334155; line-height: 1.65; background: #f8fafc; border-left: 3px solid #8b5cf6; padding: 10px 14px; border-radius: 4px; margin-bottom: 8px;">
-                <b style="color: #6d28d9;">【中文概括】</b>{item['summary']}
+                <b style="color: #6d28d9;">【核心概括】</b>{item['summary']}
             </div>
             <div style="font-size: 11.5px; color: #64748b; margin-top: 4px; word-break: break-all;">
                 🔗 文章链接：<a href="{item['url']}" target="_blank" style="color: #2563eb; text-decoration: underline;">{item['url']}</a>
