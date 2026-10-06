@@ -1,9 +1,7 @@
 name: index-take-profit-monitor
 
 on:
-  schedule:
-    # 每天北京时间 09:00 (UTC 01:00) 自动触发推送
-    - cron: '0 1 * * *'
+  # 由 Cloudflare Worker 准时在工作日/每日 09:00 调用 GitHub API 触发，杜绝 GitHub 原生 schedule 严重延迟（延时达数小时）的问题
   workflow_dispatch: {}
 
 jobs:

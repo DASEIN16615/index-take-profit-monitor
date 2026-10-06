@@ -52,7 +52,7 @@ def translate_to_zh(text):
 
 # ==================== 1. 宏观资产数据 (全中文标签与单位) ====================
 def fetch_macro_tickers():
-    """抓取纳斯达克100、标普500昨夜涨跌幅及全球宏观风向标"""
+    """抓取纳斯达克100、标普500昨夜涨跌幅及全球宏观风向标（精准单日隔夜涨跌）"""
     targets = [
         {"symbol": "^NDX", "name": "纳斯达克100 (昨夜)", "unit": " 点"},
         {"symbol": "^GSPC", "name": "标普500指数 (昨夜)", "unit": " 点"},
@@ -62,15 +62,23 @@ def fetch_macro_tickers():
     ]
     results = []
     for t in targets:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{t['symbol']}?interval=1d&range=2d"
+        # 使用 5 日连续日线序列，精准取前一个交易日收盘价计算真正单日隔夜涨跌幅
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{t['symbol']}?interval=1d&range=5d"
         raw = http_get_safe(url, timeout=6)
         if not raw:
             continue
         try:
             data = json.loads(raw.decode("utf-8"))
-            meta = data["chart"]["result"][0]["meta"]
-            price = meta.get("regularMarketPrice")
-            prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+            chart_res = data["chart"]["result"][0]
+            meta = chart_res["meta"]
+            closes = [c for c in chart_res["indicators"]["quote"][0].get("close", []) if c is not None]
+            if len(closes) >= 2:
+                price = closes[-1]
+                prev = closes[-2]
+            else:
+                price = meta.get("regularMarketPrice")
+                prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+            
             chg = (price - prev) / prev * 100 if (price and prev) else 0.0
             results.append({
                 "name": t["name"],
