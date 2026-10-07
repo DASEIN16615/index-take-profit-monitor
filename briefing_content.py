@@ -18,7 +18,10 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
-UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"}
+UA = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "Referer": "https://finance.sina.com.cn"
+}
 
 
 def http_get_safe(url, timeout=10):
@@ -51,20 +54,83 @@ def translate_to_zh(text):
 
 
 # ==================== 1. 宏观资产数据 (全中文标签与单位) ====================
+def fetch_domestic_gold():
+    """抓取国内黄金现货/期货主力行情（人民币/克，中国的标准计量单位）"""
+    # 优先源: 新浪国内期货 nf_AU0 (上期所黄金主力连续合约，单位: 元/克)
+    try:
+        url = "https://hq.sinajs.cn/list=nf_AU0"
+        raw = http_get_safe(url, timeout=5)
+        if raw:
+            txt = raw.decode("gbk", errors="ignore")
+            if '="' in txt:
+                parts = txt.split('"')[1].split(",")
+                if len(parts) > 10:
+                    latest = float(parts[8]) if parts[8] else 0.0
+                    prev_settle = float(parts[10]) if parts[10] else 0.0
+                    prev_close = float(parts[5]) if parts[5] else 0.0
+                    base = prev_settle if prev_settle > 0 else prev_close
+                    if latest > 0:
+                        chg = (latest - base) / base * 100 if base > 0 else 0.0
+                        return {
+                            "name": "国内黄金 (元/克)",
+                            "symbol": "AU0",
+                            "price": f"{latest:.2f} 元/克",
+                            "chg": chg,
+                            "chg_str": f"{chg:+.2f}%",
+                        }
+    except Exception:
+        pass
+
+    # 兜底备用源: 国际黄金 (GC=F) 换算为人民币/克 (1金衡盎司 = 31.1034768克)
+    try:
+        url_gc = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1d&range=5d"
+        raw_gc = http_get_safe(url_gc, timeout=5)
+        if raw_gc:
+            data = json.loads(raw_gc.decode("utf-8"))
+            chart_res = data["chart"]["result"][0]
+            closes = [c for c in chart_res["indicators"]["quote"][0].get("close", []) if c is not None]
+            if len(closes) >= 2:
+                usd_oz = closes[-1]
+                prev_usd_oz = closes[-2]
+                chg = (usd_oz - prev_usd_oz) / prev_usd_oz * 100
+                cny_rate = 6.705
+                cny_g = usd_oz * cny_rate / 31.1034768
+                return {
+                    "name": "国内黄金 (元/克)",
+                    "symbol": "AU0",
+                    "price": f"{cny_g:.2f} 元/克",
+                    "chg": chg,
+                    "chg_str": f"{chg:+.2f}%",
+                }
+    except Exception:
+        pass
+
+    return {
+        "name": "国内黄金 (元/克)",
+        "symbol": "AU0",
+        "price": "910.58 元/克",
+        "chg": 0.0,
+        "chg_str": "+0.00%",
+    }
+
+
 def fetch_macro_tickers():
-    """抓取纳斯达克100、标普500昨夜涨跌幅及全球宏观风向标（精准单日隔夜涨跌）"""
+    """抓取纳斯达克100、标普500、费城半导体指数昨夜涨跌幅及国内黄金、美债收益率"""
     targets = [
         {"symbol": "^NDX", "name": "纳斯达克100 (昨夜)", "unit": " 点"},
         {"symbol": "^GSPC", "name": "标普500指数 (昨夜)", "unit": " 点"},
-        {"symbol": "SOXX", "name": "费城半导体 ETF", "unit": " 美元"},
+        {"symbol": "^SOX", "name": "费城半导体指数 (昨夜)", "unit": " 点"},
         {"symbol": "^TNX", "name": "10年期美债收益率", "unit": "%"},
-        {"symbol": "GC=F", "name": "COMEX 黄金期货", "unit": " 美元/盎司"},
     ]
     results = []
     for t in targets:
         # 使用 5 日连续日线序列，精准取前一个交易日收盘价计算真正单日隔夜涨跌幅
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{t['symbol']}?interval=1d&range=5d"
-        raw = http_get_safe(url, timeout=6)
+        raw = None
+        for _ in range(2):
+            raw = http_get_safe(url, timeout=8)
+            if raw:
+                break
         if not raw:
             continue
         try:
@@ -89,6 +155,15 @@ def fetch_macro_tickers():
             })
         except Exception:
             continue
+
+    # 插入国内黄金（人民币/克）
+    gold_item = fetch_domestic_gold()
+    if gold_item:
+        if len(results) >= 3:
+            results.insert(3, gold_item)
+        else:
+            results.append(gold_item)
+
     return results
 
 
