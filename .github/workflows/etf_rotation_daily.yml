@@ -5,7 +5,13 @@ on:
     # 每个工作日（周一至周五）北京时间 14:30 自动运行 (UTC 06:30)
     # 为实操预留 20~25 分钟尾盘决策窗口
     - cron: '30 6 * * 1-5'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: 'Force run ignoring trading calendar filter (true/false)'
+        required: false
+        default: 'false'
+        type: string
 
 jobs:
   etf_monitor:
@@ -25,3 +31,8 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_CODE: ${{ secrets.SMTP_CODE }}
           SMTP_TO: ${{ secrets.SMTP_USER }}
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          FORCE_RUN: ${{ inputs.force_run }}
