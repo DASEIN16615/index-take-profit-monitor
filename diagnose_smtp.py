@@ -3,27 +3,29 @@ import os
 import smtplib
 import traceback
 
-def test_debug():
+def test_login_variations():
     user = os.environ.get("SMTP_USER", "").strip()
     code = os.environ.get("SMTP_CODE", "").strip()
-    print(f"Debug SMTP: user='{user[:3]}***{user[-7:]}', code_len={len(code)}")
 
-    s = smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=20)
-    s.set_debuglevel(2)
-    try:
-        print("--- EHLO ---")
-        s.ehlo()
-        print("--- LOGIN with user & code ---")
-        s.login(user, code)
-        print("--- SUCCESS! ---")
-    except Exception as e:
-        print("--- EXCEPTION ---")
-        traceback.print_exc()
-    finally:
+    variations = [
+        ("raw_user", user),
+        ("pure_digits", user.split("@")[0]),
+    ]
+    code_clean = code.replace(" ", "").strip()
+
+    for label, u in variations:
+        print(f"\n--- Trying username variation: {label} ({u}) ---")
         try:
-            s.close()
-        except:
-            pass
+            s = smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=15)
+            s.ehlo()
+            # Try AUTH LOGIN specifically instead of AUTH PLAIN
+            print(f"Logging in with user={u}...")
+            s.login(u, code_clean)
+            print(f"🎉 SUCCESS! Login worked with {label}!")
+            s.quit()
+            return label, u
+        except Exception as e:
+            print(f"Failed with {label}: {e}")
 
 if __name__ == "__main__":
-    test_debug()
+    test_login_variations()
