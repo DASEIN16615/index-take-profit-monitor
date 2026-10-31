@@ -25,6 +25,9 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Run Safeguards Unit Test Suite
+        run: python test_safeguards.py
+
       - name: Run ETF Rotation Monitor
         run: python etf_rotation_monitor.py
         env:

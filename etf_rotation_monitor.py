@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-A股免五 ETF 高胜率双标的阈值轮动策略 - 盘中实时监控与多通道预警系统 (P1 & P2 增强版)
+A股免五 ETF 高胜率双标的阈值轮动策略 - 盘中实时监控与多通道预警系统 (P1 + P2 + P3 全维度兜底版)
 ================================================================================
 运行频率: 每个交易日 14:30 自动触发 (UTC 06:30)
 资金方案:
@@ -13,12 +13,17 @@ A股免五 ETF 高胜率双标的阈值轮动策略 - 盘中实时监控与多�
   - 顺周期:   有色金属 (512400), 煤炭 (515220), 石油 (561360)
   - 防御金融: 红利低波 (512890), 银行 (512800), 电力 (159611)
 
-核心升级特性 (P1 & P2):
+核心升级特性 (P1 + P2 + P3):
   1. 【P1 交易日历过滤】: 抓取数据前判断当天是否为 A 股交易日/休市日，法定节假日与周末休市时优雅退出，避免空发或报错打扰。
   2. 【P1 多通道 Webhook 即时推送】: 支持可选配置企业微信 (WECOM_WEBHOOK)、钉钉 (DINGTALK_WEBHOOK)、飞书 (FEISHU_WEBHOOK)、PushPlus (PUSHPLUS_TOKEN)，多端即时触达。
   3. 【P2 背包规划资金拉满】: 贪心/背包动态优化整手买入逻辑，消除 100 股整手约束下的零钱闲置 (Cash Drag)，小微资金利用率提升至 90%~99.8%，大额资金提升至 99.99%。
   4. 【P2 百万大额实盘方案】: 增设计划表与大额资金专项冲击成本、分批限价委托 (TWAP) 与盘口流动性风控提示。
-  5. 【零三方依赖】: 严格保持纯 Python 标准库 (urllib, smtplib, json, math)。
+  5. 【P3 数据源主备兜底 (Dual Data Provider)】: 主数据源为腾讯财经，若遇网络超时或格式异常，自动无缝降级切换至新浪财经 (hq.sinajs.cn) 备用接口。
+  6. 【P3 单标的故障隔离 (Symbol Isolation)】: 标的遭遇停牌、无成交或数据缺失时自动隔离告警并跳过，保证其余正常标的完成轮动，不导致全局崩溃。
+  7. 【P3 大盘基准失效兜底 (Regime Fallback)】: 若上证指数 (sh000001) 无法获取，兜底回退为保守防御模式 (50% 红利低波 + 50% 现金)，防范黑天鹅失控。
+  8. 【P3 推送与展示双重兜底 (Step Summary Fallback)】: 自动将格式化 Markdown 内参写入 GitHub Actions 的 $GITHUB_STEP_SUMMARY，页面 1 秒即查。
+  9. 【P3 数值安全兜底 (Zero-Division & Edge Guards)】: 零标准差、K线不足、除零、极值浮点等全量防御，默认填充安全值。
+  10.【零三方依赖】: 严格保持纯 Python 3 标准库 (urllib, smtplib, json, math)。
 """
 
 import os
@@ -60,14 +65,19 @@ ETF_UNIVERSE = {
 }
 
 
-def http_get_direct(url, timeout=15):
-    """绕过代理直接发起 HTTP GET 请求"""
+def http_get_direct(url, headers=None, timeout=12):
+    """
+    绕过系统代理直接发起 HTTP GET 请求，支持自定义 Headers 和超时
+    纯 Python 3 标准库实现，包含完善的异常处理
+    """
     proxy_handler = urllib.request.ProxyHandler({})
     opener = urllib.request.build_opener(proxy_handler)
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    )
+    req_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    if headers:
+        req_headers.update(headers)
+    req = urllib.request.Request(url, headers=req_headers)
     with opener.open(req, timeout=timeout) as resp:
         return resp.read()
 
@@ -144,17 +154,11 @@ def check_trading_day(force=False):
         # 备选新浪行情接口兜底
         if not market_date:
             try:
-                proxy_handler = urllib.request.ProxyHandler({})
-                opener = urllib.request.build_opener(proxy_handler)
-                req = urllib.request.Request(
+                sina_raw = http_get_direct(
                     "http://hq.sinajs.cn/list=sh000001",
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                        "Referer": "http://finance.sina.com.cn"
-                    }
-                )
-                with opener.open(req, timeout=4) as resp:
-                    sina_raw = resp.read().decode("gbk", errors="ignore")
+                    headers={"Referer": "http://finance.sina.com.cn"},
+                    timeout=4
+                ).decode("gbk", errors="ignore")
                 if "=" in sina_raw:
                     sina_parts = sina_raw.split("=")[1].strip('";\n').split(",")
                     if len(sina_parts) > 30 and sina_parts[30]:
@@ -168,78 +172,247 @@ def check_trading_day(force=False):
     return True, f"正常交易日 ({today_str} {weekday_cn})"
 
 
+def fetch_shanghai_index():
+    """
+    P3 优化项: 上证指数双数据源主备获取
+    先尝试腾讯财经接口，若失败自动降级至新浪财经。
+    若两源皆不可用，返回 None，触发大盘基准失效兜底 (Regime Fallback)。
+    """
+    # 1. 尝试腾讯接口
+    try:
+        raw = http_get_direct("http://qt.gtimg.cn/q=sh000001", timeout=6).decode("gbk", errors="ignore")
+        if "=" in raw:
+            parts = raw.split("=")[1].strip('";\n').split("~")
+            if len(parts) > 35:
+                price = float(parts[3])
+                prev_close = float(parts[4])
+                chg_pct = float(parts[32]) if parts[32] else ((price / prev_close - 1.0) * 100.0 if prev_close > 0 else 0.0)
+                dt_str = parts[30][:8]
+                date_fmt = f"{dt_str[:4]}-{dt_str[4:6]}-{dt_str[6:8]}"
+                if price > 0:
+                    return {
+                        "name": "上证指数",
+                        "price": price,
+                        "prev_close": prev_close,
+                        "change_pct": chg_pct,
+                        "date": date_fmt,
+                        "provider": "腾讯财经"
+                    }
+    except Exception as e:
+        print(f"[Warn] 腾讯接口获取上证指数失败: {e}，尝试切换新浪备用接口")
+
+    # 2. 备选新浪接口
+    try:
+        raw_sina = http_get_direct(
+            "http://hq.sinajs.cn/list=sh000001",
+            headers={"Referer": "http://finance.sina.com.cn"},
+            timeout=6
+        ).decode("gbk", errors="ignore")
+        if "=" in raw_sina:
+            parts = raw_sina.split("=")[1].strip('";\n').split(",")
+            if len(parts) > 30:
+                price = float(parts[3])
+                prev_close = float(parts[2])
+                chg_pct = ((price / prev_close - 1.0) * 100.0) if prev_close > 0 else 0.0
+                date_str = parts[30].strip()
+                if price > 0:
+                    return {
+                        "name": "上证指数",
+                        "price": price,
+                        "prev_close": prev_close,
+                        "change_pct": chg_pct,
+                        "date": date_str,
+                        "provider": "新浪财经"
+                    }
+    except Exception as e:
+        print(f"[Error] 新浪备用接口获取上证指数失败: {e}")
+
+    return None
+
+
+def fetch_kline_data(symbol, count=100):
+    """
+    P3 优化项: 标的历史 K 线主备双源拉取
+    主源: 腾讯前复权日线接口 (web.ifzq.gtimg.cn)
+    备用源: 新浪财经日线接口 (money.finance.sina.com.cn)
+    返回值: (records: list, provider: str)
+    """
+    # 1. 主源: 腾讯接口
+    try:
+        url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},day,,,{count},qfq"
+        content = http_get_direct(url, timeout=8)
+        data = json.loads(content.decode("utf-8"))
+        stock_data = data.get("data", {}).get(symbol, {})
+        k_list = stock_data.get("qfqday", stock_data.get("day", []))
+        if k_list and isinstance(k_list, list) and len(k_list) > 0:
+            records = []
+            for item in k_list:
+                try:
+                    dt = str(item[0])
+                    o = float(item[1])
+                    c = float(item[2])
+                    h = float(item[3])
+                    l = float(item[4])
+                    v = float(item[5])
+                    records.append({"date": dt, "open": o, "high": h, "low": l, "close": c, "vol": v})
+                except (ValueError, IndexError):
+                    continue
+            if len(records) > 0:
+                return records, "腾讯财经"
+    except Exception as e:
+        print(f"[Warn] 腾讯 K 线接口获取 {symbol} 失败 ({e})，无缝切换至新浪备用接口")
+
+    # 2. 备用源: 新浪接口
+    try:
+        url = f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={symbol}&scale=240&ma=no&datalen={count}"
+        content = http_get_direct(url, headers={"Referer": "http://finance.sina.com.cn"}, timeout=8)
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            text = content.decode("gbk", errors="ignore")
+        data = json.loads(text)
+        if isinstance(data, list) and len(data) > 0:
+            records = []
+            for item in data:
+                try:
+                    dt = str(item["day"])
+                    o = float(item["open"])
+                    c = float(item["close"])
+                    h = float(item["high"])
+                    l = float(item["low"])
+                    v = float(item["volume"])
+                    records.append({"date": dt, "open": o, "high": h, "low": l, "close": c, "vol": v})
+                except (ValueError, KeyError):
+                    continue
+            if len(records) > 0:
+                print(f"[Fallback] 标的 {symbol} 成功通过新浪财经接口获取历史 K 线 ({len(records)} 条)")
+                return records, "新浪财经"
+    except Exception as e:
+        print(f"[Error] 新浪备用 K 线接口获取 {symbol} 失败: {e}")
+
+    return [], "none"
+
+
+def fetch_live_quote(symbol):
+    """
+    P3 优化项: 标的盘中实时快照主备双源拉取
+    主源: 腾讯 qt.gtimg.cn
+    备用源: 新浪 hq.sinajs.cn
+    返回值: dict 或 None
+    """
+    # 1. 主源: 腾讯接口
+    try:
+        url = f"http://qt.gtimg.cn/q={symbol}"
+        raw = http_get_direct(url, timeout=5).decode("gbk", errors="ignore")
+        if "=" in raw:
+            parts = raw.split("=")[1].strip('";\n').split("~")
+            if len(parts) > 35:
+                price = float(parts[3])
+                if price > 0:
+                    today_str = parts[30][:8]
+                    today_fmt = f"{today_str[:4]}-{today_str[4:6]}-{today_str[6:8]}"
+                    return {
+                        "price": price,
+                        "open": float(parts[5]) if float(parts[5]) > 0 else price,
+                        "high": float(parts[33]) if float(parts[33]) > 0 else price,
+                        "low": float(parts[34]) if float(parts[34]) > 0 else price,
+                        "vol": float(parts[6]) * 100.0,  # 腾讯单位手转股
+                        "date": today_fmt,
+                        "provider": "腾讯财经"
+                    }
+    except Exception as e:
+        print(f"[Warn] 腾讯快照接口获取 {symbol} 失败 ({e})，切换新浪备用接口")
+
+    # 2. 备用源: 新浪接口
+    try:
+        url = f"http://hq.sinajs.cn/list={symbol}"
+        raw = http_get_direct(url, headers={"Referer": "http://finance.sina.com.cn"}, timeout=5).decode("gbk", errors="ignore")
+        if "=" in raw:
+            parts = raw.split("=")[1].strip('";\n').split(",")
+            if len(parts) > 30:
+                price = float(parts[3])
+                if price > 0:
+                    date_str = parts[30].strip()
+                    return {
+                        "price": price,
+                        "open": float(parts[1]) if float(parts[1]) > 0 else price,
+                        "high": float(parts[4]) if float(parts[4]) > 0 else price,
+                        "low": float(parts[5]) if float(parts[5]) > 0 else price,
+                        "vol": float(parts[8]),  # 新浪单位为股
+                        "date": date_str,
+                        "provider": "新浪财经"
+                    }
+    except Exception as e:
+        print(f"[Error] 新浪备用快照接口获取 {symbol} 失败: {e}")
+
+    return None
+
+
 def fetch_etf_history_and_live(code_info):
     """
-    拉取单只 ETF 历史 100 日前复权 (QFQ) 日线，并融合今日 14:30 盘中最新价
+    拉取单只 ETF 历史 K 线并融合盘中实时快照 (主备双源保障)
+    包含故障隔离检查：停牌、无成交或数据缺失标的返回 is_valid=False 及错误原因
     """
     symbol = code_info["symbol"]
-    url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},day,,,100,qfq"
-    content = http_get_direct(url)
-    data = json.loads(content.decode("utf-8"))
-    stock_data = data.get("data", {}).get(symbol, {})
-    k_list = stock_data.get("qfqday", stock_data.get("day", []))
+    name = code_info["name"]
 
-    records = []
-    for item in k_list:
-        dt = item[0]
-        o = float(item[1])
-        c = float(item[2])
-        h = float(item[3])
-        l = float(item[4])
-        v = float(item[5])
-        records.append({"date": dt, "open": o, "high": h, "low": l, "close": c, "vol": v})
+    # 1. 获取历史 K 线 (主备兜底)
+    records, k_provider = fetch_kline_data(symbol, count=100)
+    if not records:
+        return [], False, f"历史K线主备数据源均无法获取 ({symbol})"
 
-    # 获取盘中实时五档行情
-    try:
-        live_url = f"http://qt.gtimg.cn/q={symbol}"
-        live_raw = http_get_direct(live_url).decode("gbk", errors="ignore")
-        if "=" in live_raw:
-            parts = live_raw.split("=")[1].strip('";\n').split("~")
-            if len(parts) > 35:
-                live_price = float(parts[3])
-                live_open = float(parts[5]) if float(parts[5]) > 0 else live_price
-                live_high = float(parts[33]) if float(parts[33]) > 0 else live_price
-                live_low = float(parts[34]) if float(parts[34]) > 0 else live_price
-                live_vol = float(parts[6]) * 100  # 手转股
-                today_str = parts[30][:8]  # YYYYMMDD
-                today_fmt = f"{today_str[:4]}-{today_str[4:6]}-{today_str[6:8]}"
+    # 2. 获取实时快照 (主备兜底)
+    live = fetch_live_quote(symbol)
+    if live and live["price"] > 0:
+        # 融合盘中最新快照到末尾
+        if records and records[-1]["date"] == live["date"]:
+            records[-1]["close"] = live["price"]
+            records[-1]["high"] = max(records[-1]["high"], live["high"])
+            records[-1]["low"] = min(records[-1]["low"], live["low"])
+            records[-1]["vol"] = max(records[-1]["vol"], live["vol"])
+        else:
+            records.append({
+                "date": live["date"],
+                "open": live["open"],
+                "high": live["high"],
+                "low": live["low"],
+                "close": live["price"],
+                "vol": live["vol"]
+            })
 
-                if live_price > 0:
-                    if records and records[-1]["date"] == today_fmt:
-                        records[-1]["close"] = live_price
-                        records[-1]["high"] = max(records[-1]["high"], live_high)
-                        records[-1]["low"] = min(records[-1]["low"], live_low)
-                        records[-1]["vol"] = max(records[-1]["vol"], live_vol)
-                    else:
-                        records.append({
-                            "date": today_fmt,
-                            "open": live_open,
-                            "high": live_high,
-                            "low": live_low,
-                            "close": live_price,
-                            "vol": live_vol
-                        })
-    except Exception as e:
-        print(f"[Warn] 获取 {code_info['name']} 盘中最新快照失败, 沿用日线: {e}")
+        # 停牌/无成交检测
+        if live["vol"] <= 0 and live["open"] <= 0:
+            return records, False, f"标的处于停牌状态或今日无成交撮合"
+    else:
+        print(f"[Notice] 标的 {name} ({symbol}) 盘中最新快照不可用，沿用历史日线收盘价")
 
-    return records
+    # 检查最低历史天数要求 (至少 25 日以支撑 20 日均线与动量计算)
+    if len(records) < 25:
+        return records, False, f"有效交易天数不足 ({len(records)} < 25 天)"
+
+    return records, True, "数据正常"
 
 
 def calculate_factors_for_etf(records):
     """
-    基于单个 ETF 历史日线计算关键因子值
+    P3 优化项: 数值安全兜底因子计算
+    对标准差为 0、历史天数不足、极值浮点等进行全量异常保护
     """
-    if len(records) < 90:
+    if not records or len(records) < 25:
         return None
 
-    closes = [r["close"] for r in records]
-    highs = [r["high"] for r in records]
-    lows = [r["low"] for r in records]
-    opens = [r["open"] for r in records]
+    closes = [float(r["close"]) for r in records]
+    highs = [float(r["high"]) for r in records]
+    lows = [float(r["low"]) for r in records]
+    opens = [float(r["open"]) for r in records]
 
     current_close = closes[-1]
-    prev_close = closes[-2]
+    prev_close = closes[-2] if len(closes) >= 2 else current_close
     today_open = opens[-1]
+
+    # 数值校验: 价格必须为正数
+    if current_close <= 0 or prev_close <= 0:
+        return None
 
     # 1. 20 日真实波幅 (ATR20)
     trs = []
@@ -249,13 +422,26 @@ def calculate_factors_for_etf(records):
         tr3 = abs(lows[i] - closes[i - 1])
         trs.append(max(tr1, tr2, tr3))
 
-    atr20 = sum(trs[-20:]) / 20.0 if len(trs) >= 20 else 0.01
+    if len(trs) >= 20:
+        atr20 = sum(trs[-20:]) / 20.0
+    elif len(trs) > 0:
+        atr20 = sum(trs) / float(len(trs))
+    else:
+        atr20 = 0.01
+
+    atr20 = max(atr20, 1e-4)  # 兜底避免极小波幅导致除零
 
     # 2. 20 日风险调整动量与 5 日动量
     close_20d_ago = closes[-21] if len(closes) >= 21 else closes[0]
     close_5d_ago = closes[-6] if len(closes) >= 6 else closes[0]
 
-    risk_adj_mom20 = (current_close - close_20d_ago) / (atr20 * math.sqrt(20) + 1e-8)
+    close_20d_ago = max(close_20d_ago, 1e-4)
+    close_5d_ago = max(close_5d_ago, 1e-4)
+
+    denom_atr = atr20 * math.sqrt(20)
+    denom_atr = max(denom_atr, 1e-6)
+
+    risk_adj_mom20 = (current_close - close_20d_ago) / denom_atr
     mom_5d = (current_close / close_5d_ago) - 1.0
     mom_20d = (current_close / close_20d_ago) - 1.0
 
@@ -263,23 +449,30 @@ def calculate_factors_for_etf(records):
     accel5_20 = mom_5d - 0.25 * mom_20d
 
     # 4. 20 日均线 (MA20)
-    ma20 = sum(closes[-20:]) / 20.0
+    c_slice_20 = closes[-20:] if len(closes) >= 20 else closes
+    ma20 = sum(c_slice_20) / float(len(c_slice_20))
     above_ma20 = current_close >= ma20
 
     # 5. 布林带 (20 日, 2 倍标准差)
-    c_slice = closes[-20:]
-    mean_20 = sum(c_slice) / 20.0
-    std_20 = math.sqrt(sum((x - mean_20) ** 2 for x in c_slice) / 20.0)
+    mean_20 = ma20
+    var_20 = sum((x - mean_20) ** 2 for x in c_slice_20) / float(len(c_slice_20))
+    std_20 = math.sqrt(max(0.0, var_20))
     boll_lower = mean_20 - 2.0 * std_20
-    boll_bias = (current_close - boll_lower) / (boll_lower + 1e-8)
+    boll_bias = ((current_close - boll_lower) / boll_lower) if boll_lower > 1e-4 else 0.0
 
     # 6. 10 日历史收益波动率在 89 日内的分位数 (Panic Volatility Rank)
-    daily_rets = [(closes[i] / closes[i - 1]) - 1.0 for i in range(1, len(closes))]
+    daily_rets = []
+    for i in range(1, len(closes)):
+        if closes[i - 1] > 0:
+            daily_rets.append((closes[i] / closes[i - 1]) - 1.0)
+        else:
+            daily_rets.append(0.0)
+
     vol10_series = []
     for i in range(10, len(daily_rets) + 1):
         window = daily_rets[i - 10:i]
         m_win = sum(window) / 10.0
-        v_win = math.sqrt(sum((x - m_win) ** 2 for x in window) / 10.0)
+        v_win = math.sqrt(max(0.0, sum((x - m_win) ** 2 for x in window) / 10.0))
         vol10_series.append(v_win)
 
     if len(vol10_series) >= 89:
@@ -287,88 +480,166 @@ def calculate_factors_for_etf(records):
         current_vol = vol_89_window[-1]
         panic_vol_rank = sum(1 for v in vol_89_window if current_vol >= v) / float(len(vol_89_window))
     else:
-        panic_vol_rank = 0.5
+        panic_vol_rank = 0.5  # 天数不足时安全默认中位数
 
     # 7. 恐慌触轨高胜率反弹触发判定
     is_panic_bounce = (panic_vol_rank >= 0.85) and (current_close <= boll_lower * 1.01)
 
     # 8. 晨间跳空过滤
-    morning_gap = (today_open / prev_close) - 1.0
+    morning_gap = ((today_open / prev_close) - 1.0) if prev_close > 0 else 0.0
     gap_warning = morning_gap > 0.015
 
+    # 浮点极值与 NaN 安全过滤
+    def safe_float(v, default=0.0):
+        if math.isnan(v) or math.isinf(v):
+            return default
+        return v
+
     return {
-        "current_close": current_close,
-        "prev_close": prev_close,
-        "daily_change_pct": (current_close / prev_close - 1.0) * 100,
-        "atr20": atr20,
-        "risk_adj_mom20": risk_adj_mom20,
-        "mom_5d_pct": mom_5d * 100,
-        "mom_20d_pct": mom_20d * 100,
-        "accel5_20": accel5_20,
-        "ma20": ma20,
-        "above_ma20": above_ma20,
-        "boll_lower": boll_lower,
-        "boll_bias_pct": boll_bias * 100,
-        "panic_vol_rank": panic_vol_rank,
-        "is_panic_bounce": is_panic_bounce,
-        "morning_gap_pct": morning_gap * 100,
-        "gap_warning": gap_warning,
+        "current_close": safe_float(current_close),
+        "prev_close": safe_float(prev_close),
+        "daily_change_pct": safe_float((current_close / prev_close - 1.0) * 100.0),
+        "atr20": safe_float(atr20),
+        "risk_adj_mom20": safe_float(risk_adj_mom20),
+        "mom_5d_pct": safe_float(mom_5d * 100.0),
+        "mom_20d_pct": safe_float(mom_20d * 100.0),
+        "accel5_20": safe_float(accel5_20),
+        "ma20": safe_float(ma20),
+        "above_ma20": bool(above_ma20),
+        "boll_lower": safe_float(boll_lower),
+        "boll_bias_pct": safe_float(boll_bias * 100.0),
+        "panic_vol_rank": safe_float(panic_vol_rank, 0.5),
+        "is_panic_bounce": bool(is_panic_bounce),
+        "morning_gap_pct": safe_float(morning_gap * 100.0),
+        "gap_warning": bool(gap_warning),
     }
 
 
 def compute_portfolio_signals():
     """
-    主计算流程: 遍历 10 只 ETF 计算得分，获取大盘 Regime 状态，输出完整调仓指引
+    主计算流程 (P3 兜底增强版):
+      1. 获取上证指数 (sh000001)，若失效则强制兜底为防守模式 (50% 红利低波 + 50% 现金)；
+      2. 遍历 ETF 标的池，主备双源拉取数据；
+      3. 故障隔离机制：停牌、无成交或数据缺失标的自动跳过，不阻断其余标的轮动；
+      4. 动态计算等权市场基准与 MA20 大盘 Regime 状态机；
+      5. 截面 Z-Score 复合动量标准化，零标准差数值保护；
+      6. 输出完整的调仓与资金方案。
     """
+    # 1. 优先获取上证指数作为大盘总锚
+    sh_index = fetch_shanghai_index()
+    sh_available = (sh_index is not None and sh_index.get("price", 0) > 0)
+
     raw_data = {}
     indicators = {}
+    isolated_etfs = []  # 故障隔离记录列表
 
+    # 2. 遍历获取各 ETF 历史与盘中数据
     for code, info in ETF_UNIVERSE.items():
-        records = fetch_etf_history_and_live(info)
-        raw_data[code] = records
-        fac = calculate_factors_for_etf(records)
-        if fac:
-            indicators[code] = fac
+        records, is_valid, status_msg = fetch_etf_history_and_live(info)
+        if not is_valid:
+            print(f"[Warn] 标的故障隔离: 【{info['name']}】({code}) - 原因: {status_msg}")
+            isolated_etfs.append({"code": code, "name": info["name"], "reason": status_msg})
+            continue
 
-    # 计算 10-ETF 等权市场基准指数与 MA20
-    all_dates = sorted(list(set.intersection(*[set(r["date"] for r in raw_data[c]) for c in ETF_UNIVERSE])))
+        fac = calculate_factors_for_etf(records)
+        if not fac:
+            print(f"[Warn] 标的故障隔离: 【{info['name']}】({code}) - 因子计算失败，已隔离跳过")
+            isolated_etfs.append({"code": code, "name": info["name"], "reason": "因子数值计算失败"})
+            continue
+
+        raw_data[code] = records
+        indicators[code] = fac
+
+    # 3. 校验健康标的数量
+    valid_codes = list(indicators.keys())
+    if len(valid_codes) < 2:
+        print("[Critical] 标的池健康样本不足 2 只，触发终极防守兜底")
+        target_etf_1 = "512890" if "512890" in indicators else (valid_codes[0] if valid_codes else "CASH")
+        return {
+            "as_of_date": datetime.now(BEIJING_TZ).strftime("%Y-%m-%d"),
+            "is_bear_regime": True,
+            "sh_index": sh_index,
+            "ew_current": 1000.0,
+            "ew_ma20": 1000.0,
+            "ew_ma20_slope": 0.0,
+            "ranked_etfs": [],
+            "isolated_etfs": isolated_etfs,
+            "target_etf_1": target_etf_1,
+            "target_etf_2": "CASH",
+            "target_reason": "标的池有效样本不足兜底: 切换为保守防御模式 (50% 红利低波 + 50% 现金)",
+            "fallback_triggered": True
+        }
+
+    # 4. 计算健康标的等权市场基准指数与 MA20
+    all_dates = sorted(list(set.intersection(*[set(r["date"] for r in raw_data[c]) for c in valid_codes])))
+    if len(all_dates) < 25:
+        print("[Warn] 历史公共交易日不足 25 日，沿用最新单日数据")
+        all_dates = sorted(list(set.union(*[set(r["date"] for r in raw_data[c]) for c in valid_codes])))
+
     ew_history = []
-    base_prices = {c: [r["close"] for r in raw_data[c] if r["date"] == all_dates[0]][0] for c in ETF_UNIVERSE}
+    base_prices = {}
+    for c in valid_codes:
+        p_match = [r["close"] for r in raw_data[c] if r["date"] == all_dates[0]]
+        base_prices[c] = p_match[0] if p_match and p_match[0] > 0 else raw_data[c][0]["close"]
 
     for dt in all_dates:
         norm_sum = 0.0
-        for c in ETF_UNIVERSE:
-            p = [r["close"] for r in raw_data[c] if r["date"] == dt][0]
-            norm_sum += (p / base_prices[c]) * 1000.0
-        ew_history.append({"date": dt, "ew_index": norm_sum / len(ETF_UNIVERSE)})
+        counted = 0
+        for c in valid_codes:
+            p_match = [r["close"] for r in raw_data[c] if r["date"] == dt]
+            if p_match and base_prices[c] > 0:
+                norm_sum += (p_match[0] / base_prices[c]) * 1000.0
+                counted += 1
+        if counted > 0:
+            ew_history.append({"date": dt, "ew_index": norm_sum / float(counted)})
 
-    ew_closes = [h["ew_index"] for h in ew_history]
+    ew_closes = [h["ew_index"] for h in ew_history] if ew_history else [1000.0]
     ew_current = ew_closes[-1]
-    ew_ma20 = sum(ew_closes[-20:]) / 20.0
-    ew_ma20_prev5 = sum(ew_closes[-25:-5]) / 20.0
-    ew_ma20_slope = (ew_ma20 - ew_ma20_prev5) / 5.0
+    slice_len = min(len(ew_closes), 20)
+    ew_ma20 = sum(ew_closes[-slice_len:]) / float(slice_len)
 
-    # 大盘 Regime 判定: 连续 2 日跌破 MA20 且斜率向下判定为空头防守
-    is_below_ma20_today = ew_closes[-1] < ew_ma20
-    is_below_ma20_yesterday = ew_closes[-2] < (sum(ew_closes[-21:-1]) / 20.0)
-    is_bear_regime = is_below_ma20_today and is_below_ma20_yesterday and (ew_ma20_slope < 0)
+    if len(ew_closes) >= 25:
+        ew_ma20_prev5 = sum(ew_closes[-25:-5]) / 20.0
+        ew_ma20_slope = (ew_ma20 - ew_ma20_prev5) / 5.0
+        is_below_ma20_today = ew_closes[-1] < ew_ma20
+        is_below_ma20_yesterday = ew_closes[-2] < (sum(ew_closes[-21:-1]) / 20.0)
+        is_bear_regime = is_below_ma20_today and is_below_ma20_yesterday and (ew_ma20_slope < 0)
+    else:
+        ew_ma20_slope = 0.0
+        is_bear_regime = False
 
-    # 截面计算 Z-Score 复合动量分
-    mom_vals = [indicators[c]["risk_adj_mom20"] for c in indicators]
-    acc_vals = [indicators[c]["accel5_20"] for c in indicators]
+    # 5. P3 大盘基准失效兜底 (Regime Fallback): 若上证指数无法获取，强制进入空头防御模式
+    regime_fallback_triggered = False
+    if not sh_available:
+        print("[Alert] 上证指数主备数据源均无法获取，触发防黑天鹅失控保护 (Regime Fallback) -> 强制进入保守防御模式")
+        is_bear_regime = True
+        regime_fallback_triggered = True
 
-    m_mean = sum(mom_vals) / len(mom_vals)
-    m_std = math.sqrt(sum((x - m_mean) ** 2 for x in mom_vals) / len(mom_vals)) + 1e-8
-    a_mean = sum(acc_vals) / len(acc_vals)
-    a_std = math.sqrt(sum((x - a_mean) ** 2 for x in acc_vals) / len(acc_vals)) + 1e-8
+    # 6. 截面计算 Z-Score 复合动量分 (零标准差与除零全量保护)
+    mom_vals = [indicators[c]["risk_adj_mom20"] for c in valid_codes]
+    acc_vals = [indicators[c]["accel5_20"] for c in valid_codes]
+    n_valid = len(valid_codes)
+
+    m_mean = sum(mom_vals) / float(n_valid)
+    m_var = sum((x - m_mean) ** 2 for x in mom_vals) / float(n_valid)
+    m_std = math.sqrt(max(0.0, m_var))
+    if m_std < 1e-8:
+        m_std = 1.0  # 零标准差保护
+
+    a_mean = sum(acc_vals) / float(n_valid)
+    a_var = sum((x - a_mean) ** 2 for x in acc_vals) / float(n_valid)
+    a_std = math.sqrt(max(0.0, a_var))
+    if a_std < 1e-8:
+        a_std = 1.0  # 零标准差保护
 
     scored_list = []
-    for code, ind in indicators.items():
+    for code in valid_codes:
+        ind = indicators[code]
         z_mom = (ind["risk_adj_mom20"] - m_mean) / m_std
         z_acc = (ind["accel5_20"] - a_mean) / a_std
         composite_score = z_mom + z_acc
-
-        is_tactical = ind["is_panic_bounce"]
+        if math.isnan(composite_score) or math.isinf(composite_score):
+            composite_score = 0.0
 
         scored_list.append({
             "code": code,
@@ -380,10 +651,11 @@ def compute_portfolio_signals():
             "mom5_pct": ind["mom_5d_pct"],
             "composite_score": composite_score,
             "above_ma20": ind["above_ma20"],
-            "is_tactical": is_tactical,
+            "is_tactical": ind["is_panic_bounce"],
             "gap_warning": ind["gap_warning"],
             "panic_rank": ind["panic_vol_rank"],
             "boll_bias": ind["boll_bias_pct"],
+            "is_isolated": False
         })
 
     # 排序逻辑:
@@ -393,24 +665,61 @@ def compute_portfolio_signals():
 
     # 选定 Top-2
     if is_bear_regime:
-        target_etf_1 = "512890"  # 红利低波
-        target_etf_2 = "CASH"    # 现金
-        target_reason = "大盘连续破位空头防守: 50% 配红利低波锁定下行风险，50% 持现金避险"
+        # 防守优选红利低波 (512890)，若 512890 自身故障隔离，回退至银行 (512800) 或现金
+        if "512890" in indicators:
+            target_etf_1 = "512890"
+        elif "512800" in indicators:
+            target_etf_1 = "512800"
+        elif "159611" in indicators:
+            target_etf_1 = "159611"
+        else:
+            target_etf_1 = "CASH"
+
+        target_etf_2 = "CASH"
+        if regime_fallback_triggered:
+            target_reason = "大盘基准失效兜底: 上证指数无法获取，防范黑天鹅失控，强制回退为保守防御模式 (50% 红利低波 + 50% 现金)"
+        else:
+            sh_desc = f"(上证: {sh_index['price']:.1f}点, {sh_index['change_pct']:+.2f}%)" if sh_index else ""
+            target_reason = f"大盘连续破位空头防守: 50% 配红利低波锁定下行风险，50% 持现金避险 {sh_desc}"
     else:
         target_etf_1 = scored_list[0]["code"]
-        target_etf_2 = scored_list[1]["code"]
-        target_reason = f"多头进攻优选: 【{scored_list[0]['name']}】(得分 {scored_list[0]['composite_score']:+.2f}) + 【{scored_list[1]['name']}】(得分 {scored_list[1]['composite_score']:+.2f})"
+        target_etf_2 = scored_list[1]["code"] if len(scored_list) > 1 else "CASH"
+        sh_desc = f"[上证 {sh_index['price']:.1f}点 {sh_index['change_pct']:+.2f}%]" if sh_index else ""
+        target_reason = f"多头进攻优选: 【{scored_list[0]['name']}】(得分 {scored_list[0]['composite_score']:+.2f}) + 【{scored_list[1]['name']}】(得分 {scored_list[1]['composite_score']:+.2f}) {sh_desc}"
+
+    # 将被隔离的标的补充在天梯末尾展示，便于直观审计
+    for iso in isolated_etfs:
+        scored_list.append({
+            "code": iso["code"],
+            "name": iso["name"],
+            "group": ETF_UNIVERSE[iso["code"]]["group"],
+            "price": 0.0,
+            "change_pct": 0.0,
+            "mom20_pct": 0.0,
+            "mom5_pct": 0.0,
+            "composite_score": -99.99,
+            "above_ma20": False,
+            "is_tactical": False,
+            "gap_warning": False,
+            "panic_rank": 0.0,
+            "boll_bias": 0.0,
+            "is_isolated": True,
+            "isolated_reason": iso["reason"]
+        })
 
     return {
-        "as_of_date": all_dates[-1],
+        "as_of_date": all_dates[-1] if all_dates else datetime.now(BEIJING_TZ).strftime("%Y-%m-%d"),
         "is_bear_regime": is_bear_regime,
+        "sh_index": sh_index,
         "ew_current": ew_current,
         "ew_ma20": ew_ma20,
         "ew_ma20_slope": ew_ma20_slope,
         "ranked_etfs": scored_list,
+        "isolated_etfs": isolated_etfs,
         "target_etf_1": target_etf_1,
         "target_etf_2": target_etf_2,
         "target_reason": target_reason,
+        "fallback_triggered": regime_fallback_triggered
     }
 
 
@@ -421,9 +730,10 @@ def find_optimal_lots(c1, c2, budget):
       1. 双标的有效配置: 若总资金足以各买 1 手 (c1 + c2 <= budget)，则严格保证 lots1 >= 1 且 lots2 >= 1；
       2. 消除零钱闲置 (Cash Drag): 最小化剩余闲置现金 (maximize utilization)；
       3. 均衡持仓: 在同等极低闲置现金下，优先选取两标的总市值最接近 50:50 均衡的组合。
+    数值安全兜底: 全面防护负数、零除和越界。
     """
     if budget <= 0 or c1 <= 0 or c2 <= 0:
-        return {"x1": 0, "x2": 0, "spent": 0.0, "cash_left": budget}
+        return {"x1": 0, "x2": 0, "spent": 0.0, "cash_left": max(0.0, budget), "imbalance": 0.0, "penalty": 0.0}
 
     can_hold_both = (c1 + c2) <= budget
 
@@ -461,7 +771,7 @@ def find_optimal_lots(c1, c2, budget):
             }
 
     if best is None:
-        return {"x1": 0, "x2": 0, "spent": 0.0, "cash_left": budget}
+        return {"x1": 0, "x2": 0, "spent": 0.0, "cash_left": max(0.0, budget), "imbalance": 0.0, "penalty": 0.0}
 
     return best
 
@@ -479,6 +789,8 @@ def optimize_portfolio_allocation(t1_code, p1, t2_code, p2, budget, fee_rate=0.0
     """
     if budget <= 0:
         return {}
+
+    p1 = max(float(p1), 0.01)
 
     # 空头防守模式: 50% 红利低波 + 50% 现金
     if t2_code == "CASH" or p2 <= 0:
@@ -502,7 +814,7 @@ def optimize_portfolio_allocation(t1_code, p1, t2_code, p2, budget, fee_rate=0.0
                 "shares": shares1,
                 "cost": round(cost1, 2),
                 "fee": round(fee1, 2),
-                "weight_pct": round(spent1 / budget * 100, 2)
+                "weight_pct": round(spent1 / budget * 100.0, 2)
             },
             "t2": {
                 "code": "CASH",
@@ -510,18 +822,19 @@ def optimize_portfolio_allocation(t1_code, p1, t2_code, p2, budget, fee_rate=0.0
                 "shares": 0,
                 "cost": round(defensive_cash, 2),
                 "fee": 0.0,
-                "weight_pct": round(defensive_cash / budget * 100, 2)
+                "weight_pct": round(defensive_cash / budget * 100.0, 2)
             },
             "total_spent": round(spent1, 2),
             "defensive_cash": round(defensive_cash, 2),
             "idle_cash": round(idle_cash, 2),
             "cash_left": round(idle_cash, 2),
             "total_cash_left": round(total_cash_left, 2),
-            "utilization_pct": round((budget - idle_cash) / budget * 100, 2),
-            "stock_weight_pct": round(spent1 / budget * 100, 2)
+            "utilization_pct": round((budget - idle_cash) / budget * 100.0, 2),
+            "stock_weight_pct": round(spent1 / budget * 100.0, 2)
         }
 
     # 多头双标的模式
+    p2 = max(float(p2), 0.01)
     c1 = p1 * 100.0 * (1.0 + fee_rate)
     c2 = p2 * 100.0 * (1.0 + fee_rate)
 
@@ -545,7 +858,7 @@ def optimize_portfolio_allocation(t1_code, p1, t2_code, p2, budget, fee_rate=0.0
             "shares": lots1 * 100,
             "cost": round(cost1, 2),
             "fee": round(fee1, 2),
-            "weight_pct": round((cost1 + fee1) / budget * 100, 2)
+            "weight_pct": round((cost1 + fee1) / budget * 100.0, 2)
         },
         "t2": {
             "code": t2_code,
@@ -553,25 +866,27 @@ def optimize_portfolio_allocation(t1_code, p1, t2_code, p2, budget, fee_rate=0.0
             "shares": lots2 * 100,
             "cost": round(cost2, 2),
             "fee": round(fee2, 2),
-            "weight_pct": round((cost2 + fee2) / budget * 100, 2)
+            "weight_pct": round((cost2 + fee2) / budget * 100.0, 2)
         },
         "total_spent": round(total_spent, 2),
         "defensive_cash": 0.0,
         "idle_cash": round(cash_left, 2),
         "cash_left": round(cash_left, 2),
         "total_cash_left": round(cash_left, 2),
-        "utilization_pct": round(total_spent / budget * 100, 2)
+        "utilization_pct": round(total_spent / budget * 100.0, 2)
     }
 
 
 def build_monitor_content(analysis):
     """
-    生成针对邮件 (HTML+纯文本) 与多通道 Webhook (Markdown+纯文本) 的完整内容
-    包含 1,000 元、5,000 元及 1,000,000 元大额模拟实盘方案
+    生成针对邮件 (HTML+纯文本)、多通道 Webhook (Markdown+纯文本) 以及 GitHub Actions Step Summary 的完整报告内容
+    包含 1,000 元、5,000 元及 1,000,000 元大额实盘方案
     """
     as_of = analysis["as_of_date"]
     is_bear = analysis["is_bear_regime"]
     ranked = analysis["ranked_etfs"]
+    isolated = analysis.get("isolated_etfs", [])
+    sh_index = analysis.get("sh_index")
 
     t1_code = analysis["target_etf_1"]
     t2_code = analysis["target_etf_2"]
@@ -579,8 +894,8 @@ def build_monitor_content(analysis):
     t1_name = "现金储备 (防守)" if t1_code == "CASH" else ETF_UNIVERSE[t1_code]["name"]
     t2_name = "现金储备 (防守)" if t2_code == "CASH" else ETF_UNIVERSE[t2_code]["name"]
 
-    p1 = 1.0 if t1_code == "CASH" else [x["price"] for x in ranked if x["code"] == t1_code][0]
-    p2 = 1.0 if t2_code == "CASH" else [x["price"] for x in ranked if x["code"] == t2_code][0]
+    p1 = 1.0 if t1_code == "CASH" else ([x["price"] for x in ranked if x["code"] == t1_code and not x.get("is_isolated")] or [1.0])[0]
+    p2 = 1.0 if t2_code == "CASH" else ([x["price"] for x in ranked if x["code"] == t2_code and not x.get("is_isolated")] or [1.0])[0]
 
     # 背包优化整手资金分配 (1K / 5K / 1M)
     alloc_1k = optimize_portfolio_allocation(t1_code, p1, t2_code, p2, 1000.0)
@@ -589,13 +904,53 @@ def build_monitor_content(analysis):
     alloc_results = {1000: alloc_1k, 5000: alloc_5k, 1000000: alloc_1m}
 
     # 状态色板
-    status_title = "🟡 空头防守模式 (切换红利低波+现金)" if is_bear else "🟢 多头进攻模式 (持有最强双龙头)"
-    status_bg = "#fff8e6" if is_bear else "#e6f9f0"
-    status_color = "#b78103" if is_bear else "#0e8a16"
+    if analysis.get("fallback_triggered"):
+        status_title = "🛡️ 大盘基准失效兜底 (黑天鹅防失控模式)"
+        status_bg = "#fff1f0"
+        status_color = "#cf1322"
+    elif is_bear:
+        status_title = "🟡 空头防守模式 (切换红利低波+现金)"
+        status_bg = "#fff8e6"
+        status_color = "#b78103"
+    else:
+        status_title = "🟢 多头进攻模式 (持有最强双龙头)"
+        status_bg = "#e6f9f0"
+        status_color = "#0e8a16"
+
+    # 大盘基准状态文本
+    sh_txt = f"上证指数: {sh_index['price']:.2f} ({sh_index['change_pct']:+.2f}%) [{sh_index['provider']}]" if sh_index else "上证指数: 未获取 (触发失效兜底)"
+
+    # 标的隔离告警 HTML/Markdown
+    isolated_alert_html = ""
+    isolated_alert_md = ""
+    if isolated:
+        iso_items = [f"<b>{x['name']}</b> ({x['code']}): {x['reason']}" for x in isolated]
+        isolated_alert_html = f"""
+        <div style="background:#fff2e8;border:1px solid #ffbb96;border-left:6px solid #fa541c;padding:12px 16px;border-radius:6px;margin-bottom:20px;font-size:13px;color:#d4380d;">
+            <b>⚠️ 单标的故障隔离告警</b>: 检测到以下标的存在停牌或数据异常，系统已自动隔离跳过，未影响其余标的动量排序:<br>
+            {'<br>'.join(['· ' + it for it in iso_items])}
+        </div>
+        """
+        isolated_alert_md = "\n> ⚠️ **单标的故障隔离告警**: " + " | ".join([f"{x['name']}({x['code']}): {x['reason']}" for x in isolated]) + "\n"
 
     # 表格行 HTML (天梯榜)
     table_rows_html = ""
     for idx, r in enumerate(ranked, 1):
+        if r.get("is_isolated"):
+            table_rows_html += f"""
+            <tr style="background:#fff1f0;text-align:center;border-bottom:1px solid #e8e8e8;color:#999;">
+                <td style="padding:10px 6px;">-</td>
+                <td style="padding:10px 6px;text-align:left;"><b>{r['name']}</b> ({r['code']}) <span style="background:#f5222d;color:#fff;padding:2px 6px;border-radius:4px;font-size:11px;">⚠️故障隔离</span></td>
+                <td style="padding:10px 6px;">{r['group']}</td>
+                <td style="padding:10px 6px;">-</td>
+                <td style="padding:10px 6px;">-</td>
+                <td style="padding:10px 6px;">-</td>
+                <td style="padding:10px 6px;">-</td>
+                <td style="padding:10px 6px;color:#cf1322;">{r.get('isolated_reason', '数据异常')}</td>
+            </tr>
+            """
+            continue
+
         is_picked = r["code"] in [t1_code, t2_code]
         row_bg = "#f0f7ff" if is_picked else ("#ffffff" if idx % 2 == 1 else "#fcfcfc")
         pick_badge = '<span style="background:#1890ff;color:#fff;padding:2px 6px;border-radius:4px;font-size:12px;">入选持仓</span>' if is_picked else ""
@@ -642,6 +997,7 @@ def build_monitor_content(analysis):
         format_plan_html(alloc_1m, "1,000,000 元<br><span style='font-size:11px;color:#888;'>(大额模拟实盘)</span>", "#f6ffed")
     )
 
+    # 完整 HTML 邮件内容
     html = f"""
     <!DOCTYPE html>
     <html>
@@ -652,16 +1008,18 @@ def build_monitor_content(analysis):
             <!-- 头部 Banner -->
             <div style="background:linear-gradient(135deg, #1890ff 0%, #0050b3 100%);padding:24px 30px;color:#fff;">
                 <div style="font-size:24px;font-weight:bold;letter-spacing:1px;">🚀 A股免五 ETF 高胜率双标的轮动内参</div>
-                <div style="font-size:14px;opacity:0.85;margin-top:6px;">盘中 14:30 自动监测 | 交易日历过滤 & 背包资金拉满 & 100万大额风控</div>
+                <div style="font-size:14px;opacity:0.85;margin-top:6px;">盘中 14:30 自动监测 | 主备数据源 & 故障隔离 & 背包资金拉满 & 100万大额风控</div>
             </div>
 
             <div style="padding:24px 30px;">
+                {isolated_alert_html}
+
                 <!-- 核心状态卡片 -->
                 <div style="background:{status_bg};border-left:6px solid {status_color};padding:16px 20px;border-radius:6px;margin-bottom:24px;">
                     <div style="font-size:18px;font-weight:bold;color:{status_color};">{status_title}</div>
                     <div style="font-size:14px;color:#555;margin-top:6px;line-height:1.6;">
                         <b>判定理由</b>: {analysis['target_reason']}<br>
-                        <b>等权大盘基准</b>: {analysis['ew_current']:.1f}点 (MA20: {analysis['ew_ma20']:.1f}点, 斜率: {analysis['ew_ma20_slope']:+.2f})
+                        <b>大盘基准锚</b>: {sh_txt} | <b>等权基准</b>: {analysis['ew_current']:.1f}点 (MA20: {analysis['ew_ma20']:.1f}点, 斜率: {analysis['ew_ma20_slope']:+.2f})
                     </div>
                 </div>
 
@@ -732,7 +1090,7 @@ def build_monitor_content(analysis):
 
             <!-- 底部说明 -->
             <div style="background:#fafafa;padding:16px 30px;font-size:12px;color:#8c8c8c;border-top:1px solid #f0f0f0;text-align:center;">
-                A股免五 ETF 高胜率双标的轮动系统 (P1+P2版) | GitHub Actions 每日 14:30 自动生成 | 数据时间: {as_of}
+                A股免五 ETF 高胜率双标的轮动系统 (P1+P2+P3兜底版) | GitHub Actions 每日 14:30 自动生成 | 数据时间: {as_of}
             </div>
         </div>
     </body>
@@ -751,13 +1109,22 @@ def build_monitor_content(analysis):
         t2_txt_1m = f"买入 {alloc_1m['t2']['lots']} 手 ({alloc_1m['t2']['shares']:,} 股), 耗资 {alloc_1m['t2']['cost']:,.2f} 元"
         spare_lbl = "留存备用金"
 
-    # 纯文本备用内容 (终端打印 & 邮件 fallback)
+    # 纯文本内容
     text_lines = [
         f"【A股免五ETF高胜率双标的轮动内参】({as_of})",
         "=" * 60,
         f"状态: {status_title}",
         f"理由: {analysis['target_reason']}",
+        f"大盘: {sh_txt}",
         "-" * 60,
+    ]
+    if isolated:
+        text_lines.append("【标的隔离告警】")
+        for x in isolated:
+            text_lines.append(f" - {x['name']} ({x['code']}): {x['reason']}")
+        text_lines.append("-" * 60)
+
+    text_lines.extend([
         "【今日建议目标持仓 (各 50% 仓位)】",
         f"标的 1: {t1_name} ({t1_code}) - 参考价: {p1:.3f} 元",
         f"标的 2: {t2_name} ({t2_code}) - 参考价: {p2:.3f} 元",
@@ -778,8 +1145,8 @@ def build_monitor_content(analysis):
         f"   * 100万冲击提示: 严禁市价单！请于 14:35~14:55 分 3-5 笔限价挂单委托，规避冲击滑点。",
         "=" * 60,
         "【全天梯动量排名 Top 5】",
-    ]
-    for idx, r in enumerate(ranked[:5], 1):
+    ])
+    for idx, r in enumerate([x for x in ranked if not x.get("is_isolated")][:5], 1):
         text_lines.append(f"{idx}. {r['name']}({r['code']}): 现价 {r['price']:.3f}, 复合得分 {r['composite_score']:+.2f}, 今日涨跌 {r['change_pct']:+.2f}%")
 
     text = "\n".join(text_lines)
@@ -788,17 +1155,18 @@ def build_monitor_content(analysis):
     # Markdown 内容 (专供企业微信 & 钉钉机器人)
     top5_md = "\n".join([
         f"> {i}. **{r['name']}** ({r['code']}): 现价 `{r['price']:.3f}`, 得分 `{r['composite_score']:+.2f}`, 今日 `{r['change_pct']:+.2f}%`"
-        for i, r in enumerate(ranked[:5], 1)
+        for i, r in enumerate([x for x in ranked if not x.get("is_isolated")][:5], 1)
     ])
 
     t2_md_1k = f"防守持币 {alloc_1k['defensive_cash']:.1f}元" if t2_code == "CASH" else f"买入 {alloc_1k['t2']['lots']} 手 ({alloc_1k['t2']['shares']} 股, {alloc_1k['t2']['cost']:.1f}元)"
     t2_md_5k = f"防守持币 {alloc_5k['defensive_cash']:.1f}元" if t2_code == "CASH" else f"买入 {alloc_5k['t2']['lots']} 手 ({alloc_5k['t2']['shares']} 股, {alloc_5k['t2']['cost']:.1f}元)"
     t2_md_1m = f"防守持币 {alloc_1m['defensive_cash']:,.1f}元" if t2_code == "CASH" else f"买入 {alloc_1m['t2']['lots']} 手 ({alloc_1m['t2']['shares']:,} 股, {alloc_1m['t2']['cost']:,.1f}元)"
 
-    markdown_text = f"""### 🚀 A股免五 ETF 轮动内参 ({as_of})
+    webhook_markdown = f"""### 🚀 A股免五 ETF 轮动内参 ({as_of})
 > **市场状态**: {status_title}
 > **核心理由**: {analysis['target_reason']}
-
+> **大盘基准**: {sh_txt}
+{isolated_alert_md}
 🎯 **今日建议持仓 (各 50% 仓位)**:
 - **标的 1**: {t1_name} (`{t1_code}`) | 现价: `{p1:.3f}` 元
 - **标的 2**: {t2_name} (`{t2_code}`) | 现价: `{p2:.3f}` 元
@@ -823,7 +1191,99 @@ def build_monitor_content(analysis):
 {top5_md}
 """
 
-    return text, html, markdown_text, subject, alloc_results
+    # P3 优化项: GitHub Actions Step Summary 专属 Markdown (超全表格与图表排版)
+    # 生成全量标的天梯 Markdown 表格
+    step_table_lines = [
+        "| 排名 | ETF 标的 | 分类 | 最新价 | 今日涨跌 | 20日涨跌 | 复合得分 | 状态 |",
+        "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |"
+    ]
+    for idx, r in enumerate(ranked, 1):
+        if r.get("is_isolated"):
+            step_table_lines.append(f"| - | **{r['name']}** (`{r['code']}`) | {r['group']} | - | - | - | - | ⚠️ `{r.get('isolated_reason', '故障隔离')}` |")
+        else:
+            is_picked = r["code"] in [t1_code, t2_code]
+            pick_tag = " 🌟 **入选**" if is_picked else ""
+            tac_tag = " ⚡恐慌反弹" if r["is_tactical"] else ""
+            gap_tag = " 🚨高开" if r["gap_warning"] else ""
+            status_desc = "✅ 站上MA20" if r["above_ma20"] else "❌ 跌破MA20"
+            step_table_lines.append(
+                f"| {idx} | **{r['name']}** (`{r['code']}`){pick_tag}{tac_tag}{gap_tag} | {r['group']} | "
+                f"`{r['price']:.3f}` | `{r['change_pct']:+.2f}%` | `{r['mom20_pct']:+.1f}%` | "
+                f"**`{r['composite_score']:+.2f}`** | {status_desc} |"
+            )
+
+    step_table_md = "\n".join(step_table_lines)
+
+    step_summary_md = f"""# 🚀 A股免五 ETF 高胜率双标的轮动内参 ({as_of})
+
+> **市场状态**: **{status_title}**  
+> **核心理由**: {analysis['target_reason']}  
+> **大盘基准**: `{sh_txt}` | **等权基准**: `{analysis['ew_current']:.1f}` (MA20: `{analysis['ew_ma20']:.1f}`, 斜率: `{analysis['ew_ma20_slope']:+.2f}`)  
+{isolated_alert_md}
+
+---
+
+### 🎯 今日 14:50 建议目标持仓 (各 50% 仓位)
+
+| 配置维度 | 标的 1 (50% 仓位) | 标的 2 (50% 仓位) |
+| :--- | :--- | :--- |
+| **资产名称** | **{t1_name}** (`{t1_code}`) | **{t2_name}** (`{t2_code}`) |
+| **参考现价** | `{p1:.3f} 元` | `{p2:.3f} 元` |
+| **仓位定位** | 龙头进攻优选 | 龙头进攻优选 / 50% 现金防守避险 |
+
+---
+
+### 💰 背包规划资金拉满建仓方案 (免五万1，消除零钱闲置)
+
+| 资金档位 | 标的一: {t1_name} | 标的二: {t2_name} | 留存备用现金 | 资金规划率 |
+| :---: | :--- | :--- | :---: | :---: |
+| **1,000 元** *(极小微整手)* | 买入 **{alloc_1k['t1']['lots']}** 手 (`{alloc_1k['t1']['shares']:,}`股, `{alloc_1k['t1']['cost']:.2f}`元) | {t2_md_1k} | `{alloc_1k['cash_left']:.2f}` 元 | **`{alloc_1k['utilization_pct']:.2f}%`** |
+| **5,000 元** *(常规小微实盘)* | 买入 **{alloc_5k['t1']['lots']}** 手 (`{alloc_5k['t1']['shares']:,}`股, `{alloc_5k['t1']['cost']:.2f}`元) | {t2_md_5k} | `{alloc_5k['cash_left']:.2f}` 元 | **`{alloc_5k['utilization_pct']:.2f}%`** |
+| **1,000,000 元** *(大额模拟实盘)* | 买入 **{alloc_1m['t1']['lots']}** 手 (`{alloc_1m['t1']['shares']:,}`股, `{alloc_1m['t1']['cost']:,.2f}`元) | {t2_md_1m} | `{alloc_1m['cash_left']:,.2f}` 元 | **`{alloc_1m['utilization_pct']:.2f}%`** |
+
+> ⚠️ **100 万元大额专项冲击成本指引**:
+> 1. **严禁市价单委托**: 单标的约 50 万元（1,500 ~ 5,000 手），市价单直接吃单在中小盘 ETF 上极易击穿 3~5 档深度，造成 0.3%~0.8% 冲击滑点（单笔损失 1,500~4,000 元）；
+> 2. **分批挂单 (TWAP)**: 14:35 ~ 14:55 窗口内，分 3~5 笔限价挂买一/卖一档委托（每笔 300~500 手）；
+> 3. **流动性门槛**: 优先选取当日成交额 > 5,000 万元标的，未完全成交部分在 14:57 以前参与尾盘集合竞价。
+
+---
+
+### 📊 10 只免五核心 ETF 截面动量与信号天梯
+
+{step_table_md}
+
+---
+
+### 💡 交易纪律与执行守则
+1. **阈值防抽搐**: 若您当前已持有前 2 名之一，且新标的分差未超过 15%，**坚决不调仓**，避免横跳摩擦；
+2. **硬止损与动态止盈**: 单只持仓亏损达到 **-4.0%** 坚决止损转入现金或红利低波；浮盈达 **+7.0%** 后自最高点回撤 2.5% 动态止盈；
+3. **尾盘执行**: 建议在 14:50 ~ 14:55 以买一/卖一档限价单委托，规避市价单冲击。
+
+*系统说明: A股免五 ETF 双标的轮动系统 (P1+P2+P3全兜底版) | 主备数据源 + 标的隔离 + Regime兜底 + Step Summary | 生成时间: {datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")}*
+"""
+
+    return text, html, webhook_markdown, step_summary_md, subject, alloc_results
+
+
+def write_github_step_summary(summary_markdown):
+    """
+    P3 优化项: 推送与展示双重兜底 (Step Summary Fallback)
+    将格式化 Markdown 内参自动写入 GitHub Actions 的 $GITHUB_STEP_SUMMARY。
+    即便 SMTP 或 Webhook 遭遇网络故障，用户登录 GitHub Actions 页面也能在 1 秒内看到当天完整的图表内参。
+    """
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
+    if not summary_path:
+        # 非 GitHub Actions 环境下，静默跳过或调试输出
+        return False
+
+    try:
+        with open(summary_path, "a", encoding="utf-8") as f:
+            f.write(summary_markdown + "\n")
+        print(f"✅ 成功写入 GitHub Actions Step Summary ({summary_path})")
+        return True
+    except Exception as e:
+        print(f"[Warn] 写入 GITHUB_STEP_SUMMARY 失败: {e}")
+        return False
 
 
 def send_email(text_body, html_body, subject):
@@ -977,7 +1437,7 @@ def main():
     force_mode = ("--force" in sys.argv) or (os.environ.get("FORCE_RUN", "").strip().lower() in ("true", "1", "yes"))
 
     print("=" * 65)
-    print("启动 A股免五 ETF 高胜率双标的阈值轮动盘中监控系统 (P1 & P2 增强版)...")
+    print("启动 A股免五 ETF 高胜率双标的阈值轮动盘中监控系统 (P1+P2+P3全兜底版)...")
     print("=" * 65)
 
     # P1 核心特性: 交易日历过滤
@@ -993,17 +1453,20 @@ def main():
     else:
         print(f"[Info] 交易日判定通过: {reason}")
 
-    # 计算信号
+    # 计算信号 (P3 增强版)
     analysis = compute_portfolio_signals()
-    text, html, markdown_text, subject, alloc_results = build_monitor_content(analysis)
+    text, html, webhook_markdown, step_summary_md, subject, alloc_results = build_monitor_content(analysis)
 
     print("\n" + text + "\n")
+
+    # P3 核心特性: 推送与展示双重兜底 (写入 GitHub Actions Step Summary)
+    write_github_step_summary(step_summary_md)
 
     # 邮件推送
     send_email(text, html, subject)
 
     # P1 核心特性: 多通道 Webhook 推送
-    send_webhook_notifications(subject, markdown_text, text, html)
+    send_webhook_notifications(subject, webhook_markdown, text, html)
 
     print("=" * 65)
     print(">> 盘中监控与决策方案生成完毕！")
