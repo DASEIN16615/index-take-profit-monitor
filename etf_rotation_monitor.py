@@ -532,10 +532,7 @@ def build_email_content(analysis):
 
 
 def send_email(text_body, html_body, subject):
-    """通过 QQ 邮箱 SMTP (优先 465 SSL，备选 587 STARTTLS，支持重试) 发送邮件"""
-    import time
-    import ssl
-
+    """通过 QQ 邮箱 SMTP SSL 发送邮件"""
     user = os.environ.get("SMTP_USER", "").strip()
     code = os.environ.get("SMTP_CODE", "").strip()
     to = os.environ.get("SMTP_TO", "").strip() or user
@@ -555,38 +552,21 @@ def send_email(text_body, html_body, subject):
     if html_body:
         msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-    # 尝试重试：最多 3 轮
-    for attempt in range(1, 4):
-        print(f"[Email] 正在推送邮件至 {recipient} (尝试 {attempt}/3)...")
-        # 1. 尝试 465 SSL
-        try:
-            context = ssl.create_default_context()
-            with smtplib.SMTP_SSL("smtp.qq.com", 465, context=context, timeout=25) as s:
-                s.login(user, code)
-                s.sendmail(sender, [recipient], msg.as_string())
-            print(f"✅ 邮件已成功通过 465 SSL 送达至 QQ 邮箱: {recipient}")
-            return True
-        except Exception as e465:
-            print(f"  [465 失败] {type(e465).__name__}: {e465}")
-
-        # 2. 尝试 587 STARTTLS
-        try:
-            context = ssl.create_default_context()
-            with smtplib.SMTP("smtp.qq.com", 587, timeout=25) as s:
-                s.ehlo()
-                s.starttls(context=context)
-                s.ehlo()
-                s.login(user, code)
-                s.sendmail(sender, [recipient], msg.as_string())
-            print(f"✅ 邮件已成功通过 587 STARTTLS 送达至 QQ 邮箱: {recipient}")
-            return True
-        except Exception as e587:
-            print(f"  [587 失败] {type(e587).__name__}: {e587}")
-
-        time.sleep(3)
-
-    print("❌ 所有 SMTP 尝试均失败")
-    return False
+    try:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL("smtp.qq.com", 465, context=context, timeout=25) as s:
+            s.login(user, code)
+            s.sendmail(sender, [recipient], msg.as_string())
+        print(f"✅ 邮件已成功送达至 QQ 邮箱: {recipient}")
+        return True
+    except smtplib.SMTPAuthenticationError as e:
+        print(f"❌ 邮件发送失败 (授权认证失败 535): {e}")
+        print("💡 提示: QQ 邮箱授权码可能已失效，请前往 QQ 邮箱 -> 设置 -> 账户 -> 生成新的 16 位授权码，并在 GitHub 仓库 Settings -> Secrets 中更新 SMTP_CODE。")
+        return False
+    except Exception as e:
+        print(f"❌ 邮件发送失败: {type(e).__name__}: {e}")
+        print("💡 提示: 若返回 Connection unexpectedly closed，多因 QQ 邮箱服务 535 认证不通过后主动断开，请确认 SMTP_CODE 授权码是否有效。")
+        return False
 
 
 def main():
