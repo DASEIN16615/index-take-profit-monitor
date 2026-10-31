@@ -1,0 +1,27 @@
+name: A-Share ETF Rotation Daily Monitor
+
+on:
+  schedule:
+    # 每个工作日（周一至周五）北京时间 14:30 自动运行 (UTC 06:30)
+    # 为实操预留 20~25 分钟尾盘决策窗口
+    - cron: '30 6 * * 1-5'
+  workflow_dispatch: {}
+
+jobs:
+  etf_monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run ETF Rotation Monitor
+        run: python etf_rotation_monitor.py
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_CODE: ${{ secrets.SMTP_CODE }}
+          SMTP_TO: ${{ secrets.SMTP_USER }}
