@@ -24,6 +24,7 @@ import sys
 import json
 import math
 import smtplib
+import ssl
 import urllib.request
 from datetime import datetime, timezone, timedelta
 from email.header import Header
