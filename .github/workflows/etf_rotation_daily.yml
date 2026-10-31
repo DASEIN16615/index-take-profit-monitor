@@ -19,6 +19,12 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Diagnose SMTP
+        run: python diagnose_smtp.py
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_CODE: ${{ secrets.SMTP_CODE }}
+
       - name: Run ETF Rotation Monitor
         run: python etf_rotation_monitor.py
         env:

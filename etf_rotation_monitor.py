@@ -532,7 +532,10 @@ def build_email_content(analysis):
 
 
 def send_email(text_body, html_body, subject):
-    """通过 QQ 邮箱 SMTP SSL 发送邮件"""
+    """通过 QQ 邮箱 SMTP (优先 465 SSL，备选 587 STARTTLS，支持重试) 发送邮件"""
+    import time
+    import ssl
+
     user = os.environ.get("SMTP_USER", "").strip()
     code = os.environ.get("SMTP_CODE", "").strip()
     to = os.environ.get("SMTP_TO", "").strip() or user
@@ -541,23 +544,49 @@ def send_email(text_body, html_body, subject):
         print("[Info] 未配置 SMTP_USER / SMTP_CODE 环境变量，跳过邮件发送 (本地打印完整内参)")
         return False
 
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = Header(subject, "utf-8")
-        msg["From"] = user
-        msg["To"] = to
-        msg.attach(MIMEText(text_body, "plain", "utf-8"))
-        if html_body:
-            msg.attach(MIMEText(html_body, "html", "utf-8"))
+    sender = user if "@" in user else f"{user}@qq.com"
+    recipient = to if "@" in to else f"{to}@qq.com"
 
-        with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=30) as s:
-            s.login(user, code)
-            s.sendmail(user, [to], msg.as_string())
-        print(f"✅ 邮件已成功送达至 QQ 邮箱: {to}")
-        return True
-    except Exception as e:
-        print(f"❌ 邮件发送失败: {type(e).__name__}: {e}")
-        return False
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = Header(subject, "utf-8")
+    msg["From"] = sender
+    msg["To"] = recipient
+    msg.attach(MIMEText(text_body, "plain", "utf-8"))
+    if html_body:
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    # 尝试重试：最多 3 轮
+    for attempt in range(1, 4):
+        print(f"[Email] 正在推送邮件至 {recipient} (尝试 {attempt}/3)...")
+        # 1. 尝试 465 SSL
+        try:
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL("smtp.qq.com", 465, context=context, timeout=25) as s:
+                s.login(user, code)
+                s.sendmail(sender, [recipient], msg.as_string())
+            print(f"✅ 邮件已成功通过 465 SSL 送达至 QQ 邮箱: {recipient}")
+            return True
+        except Exception as e465:
+            print(f"  [465 失败] {type(e465).__name__}: {e465}")
+
+        # 2. 尝试 587 STARTTLS
+        try:
+            context = ssl.create_default_context()
+            with smtplib.SMTP("smtp.qq.com", 587, timeout=25) as s:
+                s.ehlo()
+                s.starttls(context=context)
+                s.ehlo()
+                s.login(user, code)
+                s.sendmail(sender, [recipient], msg.as_string())
+            print(f"✅ 邮件已成功通过 587 STARTTLS 送达至 QQ 邮箱: {recipient}")
+            return True
+        except Exception as e587:
+            print(f"  [587 失败] {type(e587).__name__}: {e587}")
+
+        time.sleep(3)
+
+    print("❌ 所有 SMTP 尝试均失败")
+    return False
 
 
 def main():
