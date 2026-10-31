@@ -30,7 +30,7 @@ jobs:
         env:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_CODE: ${{ secrets.SMTP_CODE }}
-          SMTP_TO: ${{ secrets.SMTP_USER }}
+          SMTP_TO: ${{ secrets.SMTP_TO || secrets.SMTP_USER }}
           WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}

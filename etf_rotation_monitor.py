@@ -97,7 +97,7 @@ def check_trading_day(force=False):
     2. 周末（周六、周日）一律为非交易日（A股在调休周末亦从不开市）
     3. 工作日（周一至周五）调用法定节假日 API 与行情快照进行多层交叉校验：
        - 层级 1: Timor 节假日 API (https://timor.tech/api/holiday/info/{YYYY-MM-DD})
-       - 层级 2: 盘中/盘后行情校验 (10:00 之后若行情最新日期非今日，则说明未开市)
+       - 层级 2: 盘中/盘后行情双源时间戳校验 (10:00 之后若腾讯/新浪行情最新成交日期非今日，则说明未开市)
        - 若网络异常，工作日默认放行，避免误拦截。
     返回: (is_trade_day: bool, reason: str)
     """
@@ -120,24 +120,50 @@ def check_trading_day(force=False):
         content = http_get_direct(url, timeout=4).decode("utf-8")
         data = json.loads(content)
         holiday_info = data.get("holiday")
-        if holiday_info and holiday_info.get("holiday") is True:
-            h_name = holiday_info.get("name", "法定节假日")
+        type_info = data.get("type", {})
+        is_holiday = (holiday_info and holiday_info.get("holiday") is True) or (type_info.get("type") == 2)
+        if is_holiday:
+            h_name = (holiday_info.get("name") if holiday_info else "") or type_info.get("name") or "法定节假日"
             return False, f"法定节假日休市 ({h_name})"
     except Exception as e:
         print(f"[Warn] 节假日日历 API 请求失败 ({e})，尝试行情接口交叉验证")
 
     # 3. 盘中/盘后行情时间戳校验 (10:00 之后如果行情最新成交日期不是今天，则说明今天休市)
     if now_bj.hour >= 10:
+        market_date = None
+        # 首选腾讯行情接口
         try:
             raw = http_get_direct("http://qt.gtimg.cn/q=sh000001", timeout=4).decode("gbk", errors="ignore")
             if "=" in raw:
                 parts = raw.split("=")[1].strip('";\n').split("~")
                 if len(parts) > 30:
-                    trade_dt = parts[30][:8]
-                    if trade_dt != today_compact:
-                        return False, f"大盘无今日成交撮合记录 (最新撮合日期: {trade_dt[:4]}-{trade_dt[4:6]}-{trade_dt[6:8]})"
+                    market_date = parts[30][:8]
         except Exception as e:
             print(f"[Warn] 腾讯行情状态校验失败: {e}")
+
+        # 备选新浪行情接口兜底
+        if not market_date:
+            try:
+                proxy_handler = urllib.request.ProxyHandler({})
+                opener = urllib.request.build_opener(proxy_handler)
+                req = urllib.request.Request(
+                    "http://hq.sinajs.cn/list=sh000001",
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Referer": "http://finance.sina.com.cn"
+                    }
+                )
+                with opener.open(req, timeout=4) as resp:
+                    sina_raw = resp.read().decode("gbk", errors="ignore")
+                if "=" in sina_raw:
+                    sina_parts = sina_raw.split("=")[1].strip('";\n').split(",")
+                    if len(sina_parts) > 30 and sina_parts[30]:
+                        market_date = sina_parts[30].replace("-", "")
+            except Exception as e:
+                print(f"[Warn] 新浪行情状态校验失败: {e}")
+
+        if market_date and market_date != today_compact:
+            return False, f"大盘无今日成交撮合记录 (最新撮合日期: {market_date[:4]}-{market_date[4:6]}-{market_date[6:8]})"
 
     return True, f"正常交易日 ({today_str} {weekday_cn})"
 
@@ -388,16 +414,68 @@ def compute_portfolio_signals():
     }
 
 
+def find_optimal_lots(c1, c2, budget):
+    """
+    精确整数规划求解双标的在整手约束与交易费率下的最优手数 (lots1, lots2)。
+    目标优先级:
+      1. 双标的有效配置: 若总资金足以各买 1 手 (c1 + c2 <= budget)，则严格保证 lots1 >= 1 且 lots2 >= 1；
+      2. 消除零钱闲置 (Cash Drag): 最小化剩余闲置现金 (maximize utilization)；
+      3. 均衡持仓: 在同等极低闲置现金下，优先选取两标的总市值最接近 50:50 均衡的组合。
+    """
+    if budget <= 0 or c1 <= 0 or c2 <= 0:
+        return {"x1": 0, "x2": 0, "spent": 0.0, "cash_left": budget}
+
+    can_hold_both = (c1 + c2) <= budget
+
+    if can_hold_both:
+        base1 = int((budget * 0.5) // c1)
+        # 大资金 (如 100 万) 在 50% 基准附近上下微调搜索，微秒级收敛且必为全局最优
+        if budget > 20000:
+            search_range = range(max(1, base1 - 15), base1 + 16)
+        else:
+            search_range = range(1, int(budget // c1) + 1)
+    else:
+        # 资金不足以同时持有两只各 1 手，降级为持有能买得起的一只或 0
+        search_range = range(0, int(budget // c1) + 1)
+
+    best = None
+    for x1 in search_range:
+        rem = budget - (x1 * c1)
+        if rem < -1e-6:
+            continue
+        x2 = int(rem // c2)
+        if can_hold_both and x2 < 1:
+            continue
+        spent = (x1 * c1) + (x2 * c2)
+        cash_left = budget - spent
+        imbalance = abs((x1 * c1) - (x2 * c2))
+        penalty = cash_left + 0.01 * imbalance
+        if best is None or penalty < best["penalty"]:
+            best = {
+                "x1": x1,
+                "x2": x2,
+                "spent": spent,
+                "cash_left": cash_left,
+                "imbalance": imbalance,
+                "penalty": penalty
+            }
+
+    if best is None:
+        return {"x1": 0, "x2": 0, "spent": 0.0, "cash_left": budget}
+
+    return best
+
+
 def optimize_portfolio_allocation(t1_code, p1, t2_code, p2, budget, fee_rate=0.0001):
     """
     P2 优化项: 背包规划资金拉满算法
     ====================================================================
     目标:
       1. 50% 基准配额平衡
-      2. 100 股整手约束下，利用剩余零钱贪心增配，消除 Cash Drag
+      2. 100 股整手约束下，精确整数规划拉满，消除 Cash Drag
       3. 计算资金利用率与真实交易费用 (万1免五)
       4. 空头模式: 50% 标的 1 + 50% 现金储备 (防守避险)
-      5. 多头模式: 双 ETF 各 50% 目标，零钱优先增补总市值较少者
+      5. 多头模式: 双 ETF 各 50% 目标，动态求解全局最优整手
     """
     if budget <= 0:
         return {}
@@ -411,7 +489,10 @@ def optimize_portfolio_allocation(t1_code, p1, t2_code, p2, budget, fee_rate=0.0
         cost1 = shares1 * p1
         fee1 = cost1 * fee_rate
         spent1 = cost1 + fee1
-        cash_left = budget - spent1
+        defensive_cash = half_budget
+        idle_cash = half_budget - spent1
+        total_cash_left = budget - spent1
+
         return {
             "budget": budget,
             "is_bear": True,
@@ -427,13 +508,16 @@ def optimize_portfolio_allocation(t1_code, p1, t2_code, p2, budget, fee_rate=0.0
                 "code": "CASH",
                 "lots": 0,
                 "shares": 0,
-                "cost": 0.0,
+                "cost": round(defensive_cash, 2),
                 "fee": 0.0,
-                "weight_pct": round(cash_left / budget * 100, 2)
+                "weight_pct": round(defensive_cash / budget * 100, 2)
             },
             "total_spent": round(spent1, 2),
-            "cash_left": round(cash_left, 2),
-            "utilization_pct": round(spent1 / half_budget * 100, 2),
+            "defensive_cash": round(defensive_cash, 2),
+            "idle_cash": round(idle_cash, 2),
+            "cash_left": round(idle_cash, 2),
+            "total_cash_left": round(total_cash_left, 2),
+            "utilization_pct": round((budget - idle_cash) / budget * 100, 2),
             "stock_weight_pct": round(spent1 / budget * 100, 2)
         }
 
@@ -441,32 +525,9 @@ def optimize_portfolio_allocation(t1_code, p1, t2_code, p2, budget, fee_rate=0.0
     c1 = p1 * 100.0 * (1.0 + fee_rate)
     c2 = p2 * 100.0 * (1.0 + fee_rate)
 
-    half_budget = budget * 0.5
-    lots1 = int(half_budget // c1) if c1 > 0 else 0
-    lots2 = int(half_budget // c2) if c2 > 0 else 0
-
-    spent = (lots1 * c1) + (lots2 * c2)
-    rem_cash = budget - spent
-
-    # 背包贪心吃零钱: 只要剩余资金还能买得起单手更便宜的 ETF，就继续加购
-    min_cost = min(c1, c2)
-    while rem_cash >= min_cost:
-        if rem_cash >= c1 and rem_cash >= c2:
-            # 两者都买得起时，优先补足持仓市值较低的一方，维持 50:50 均衡
-            if (lots1 * c1) <= (lots2 * c2):
-                lots1 += 1
-                rem_cash -= c1
-            else:
-                lots2 += 1
-                rem_cash -= c2
-        elif rem_cash >= c1:
-            lots1 += 1
-            rem_cash -= c1
-        elif rem_cash >= c2:
-            lots2 += 1
-            rem_cash -= c2
-        else:
-            break
+    best = find_optimal_lots(c1, c2, budget)
+    lots1 = best["x1"]
+    lots2 = best["x2"]
 
     cost1 = lots1 * 100 * p1
     fee1 = cost1 * fee_rate
@@ -495,7 +556,10 @@ def optimize_portfolio_allocation(t1_code, p1, t2_code, p2, budget, fee_rate=0.0
             "weight_pct": round((cost2 + fee2) / budget * 100, 2)
         },
         "total_spent": round(total_spent, 2),
+        "defensive_cash": 0.0,
+        "idle_cash": round(cash_left, 2),
         "cash_left": round(cash_left, 2),
+        "total_cash_left": round(cash_left, 2),
         "utilization_pct": round(total_spent / budget * 100, 2)
     }
 
@@ -556,16 +620,18 @@ def build_monitor_content(analysis):
     def format_plan_html(a, label, bg="#ffffff"):
         t1_txt = f"买入 {a['t1']['lots']} 手 ({a['t1']['shares']:,}股)<br><span style='font-size:12px;color:#555;'>耗资 {a['t1']['cost']:,.2f}元 ({a['t1']['weight_pct']:.1f}%)</span>"
         if a["is_bear"]:
-            t2_txt = f"<span style='color:#b78103;font-weight:bold;'>持币防守</span><br><span style='font-size:12px;color:#555;'>现金储备 ({a['t2']['weight_pct']:.1f}%)</span>"
+            t2_txt = f"<span style='color:#b78103;font-weight:bold;'>50% 现金避险</span><br><span style='font-size:12px;color:#555;'>防守持币 {a['defensive_cash']:,.2f}元 ({a['t2']['weight_pct']:.1f}%)</span>"
+            spare_txt = f"{a['idle_cash']:,.2f} 元<br><span style='font-size:11px;color:#888;'>(零钱闲置)</span>"
         else:
             t2_txt = f"买入 {a['t2']['lots']} 手 ({a['t2']['shares']:,}股)<br><span style='font-size:12px;color:#555;'>耗资 {a['t2']['cost']:,.2f}元 ({a['t2']['weight_pct']:.1f}%)</span>"
+            spare_txt = f"{a['cash_left']:,.2f} 元"
 
         return f"""
         <tr style="text-align:center;border-bottom:1px solid #e8e8e8;background:{bg};">
             <td style="padding:10px;font-weight:bold;">{label}</td>
             <td style="padding:10px;color:#1890ff;font-weight:bold;">{t1_txt}</td>
             <td style="padding:10px;color:#1890ff;font-weight:bold;">{t2_txt}</td>
-            <td style="padding:10px;color:#52c41a;font-weight:bold;">{a['cash_left']:,.2f} 元</td>
+            <td style="padding:10px;color:#52c41a;font-weight:bold;">{spare_txt}</td>
             <td style="padding:10px;font-weight:bold;color:#096dd9;">{a['utilization_pct']:.2f}%</td>
         </tr>
         """
@@ -674,9 +740,16 @@ def build_monitor_content(analysis):
     """
 
     # 纯文本建仓描述辅助
-    t2_txt_1k = "持币防守 (现金储备)" if t2_code == "CASH" else f"买入 {alloc_1k['t2']['lots']} 手 ({alloc_1k['t2']['shares']} 股), 耗资 {alloc_1k['t2']['cost']:.2f} 元"
-    t2_txt_5k = "持币防守 (现金储备)" if t2_code == "CASH" else f"买入 {alloc_5k['t2']['lots']} 手 ({alloc_5k['t2']['shares']} 股), 耗资 {alloc_5k['t2']['cost']:.2f} 元"
-    t2_txt_1m = "持币防守 (现金储备)" if t2_code == "CASH" else f"买入 {alloc_1m['t2']['lots']} 手 ({alloc_1m['t2']['shares']:,} 股), 耗资 {alloc_1m['t2']['cost']:,.2f} 元"
+    if is_bear:
+        t2_txt_1k = f"防守持币 {alloc_1k['defensive_cash']:.2f} 元 ({alloc_1k['t2']['weight_pct']:.1f}%)"
+        t2_txt_5k = f"防守持币 {alloc_5k['defensive_cash']:.2f} 元 ({alloc_5k['t2']['weight_pct']:.1f}%)"
+        t2_txt_1m = f"防守持币 {alloc_1m['defensive_cash']:,.2f} 元 ({alloc_1m['t2']['weight_pct']:.1f}%)"
+        spare_lbl = "零钱闲置"
+    else:
+        t2_txt_1k = f"买入 {alloc_1k['t2']['lots']} 手 ({alloc_1k['t2']['shares']} 股), 耗资 {alloc_1k['t2']['cost']:.2f} 元"
+        t2_txt_5k = f"买入 {alloc_5k['t2']['lots']} 手 ({alloc_5k['t2']['shares']} 股), 耗资 {alloc_5k['t2']['cost']:.2f} 元"
+        t2_txt_1m = f"买入 {alloc_1m['t2']['lots']} 手 ({alloc_1m['t2']['shares']:,} 股), 耗资 {alloc_1m['t2']['cost']:,.2f} 元"
+        spare_lbl = "留存备用金"
 
     # 纯文本备用内容 (终端打印 & 邮件 fallback)
     text_lines = [
@@ -693,15 +766,15 @@ def build_monitor_content(analysis):
         f"1. 1,000 元极小本金方案:",
         f"   - {t1_name}: 买入 {alloc_1k['t1']['lots']} 手 ({alloc_1k['t1']['shares']} 股), 耗资 {alloc_1k['t1']['cost']:.2f} 元",
         f"   - {t2_name}: {t2_txt_1k}",
-        f"   - 留存备用金: {alloc_1k['cash_left']:.2f} 元 | 资金利用率: {alloc_1k['utilization_pct']:.2f}%",
+        f"   - {spare_lbl}: {alloc_1k['cash_left']:.2f} 元 | 资金规划率: {alloc_1k['utilization_pct']:.2f}%",
         f"2. 5,000 元常规实盘方案:",
         f"   - {t1_name}: 买入 {alloc_5k['t1']['lots']} 手 ({alloc_5k['t1']['shares']} 股), 耗资 {alloc_5k['t1']['cost']:.2f} 元",
         f"   - {t2_name}: {t2_txt_5k}",
-        f"   - 留存备用金: {alloc_5k['cash_left']:.2f} 元 | 资金利用率: {alloc_5k['utilization_pct']:.2f}%",
+        f"   - {spare_lbl}: {alloc_5k['cash_left']:.2f} 元 | 资金规划率: {alloc_5k['utilization_pct']:.2f}%",
         f"3. 1,000,000 元大额模拟实盘方案:",
         f"   - {t1_name}: 买入 {alloc_1m['t1']['lots']} 手 ({alloc_1m['t1']['shares']:,} 股), 耗资 {alloc_1m['t1']['cost']:,.2f} 元",
         f"   - {t2_name}: {t2_txt_1m}",
-        f"   - 留存备用金: {alloc_1m['cash_left']:,.2f} 元 | 资金利用率: {alloc_1m['utilization_pct']:.2f}%",
+        f"   - {spare_lbl}: {alloc_1m['cash_left']:,.2f} 元 | 资金规划率: {alloc_1m['utilization_pct']:.2f}%",
         f"   * 100万冲击提示: 严禁市价单！请于 14:35~14:55 分 3-5 笔限价挂单委托，规避冲击滑点。",
         "=" * 60,
         "【全天梯动量排名 Top 5】",
@@ -718,9 +791,9 @@ def build_monitor_content(analysis):
         for i, r in enumerate(ranked[:5], 1)
     ])
 
-    t2_md_1k = "持币防守" if t2_code == "CASH" else f"买入 {alloc_1k['t2']['lots']} 手 ({alloc_1k['t2']['shares']} 股, {alloc_1k['t2']['cost']:.1f}元)"
-    t2_md_5k = "持币防守" if t2_code == "CASH" else f"买入 {alloc_5k['t2']['lots']} 手 ({alloc_5k['t2']['shares']} 股, {alloc_5k['t2']['cost']:.1f}元)"
-    t2_md_1m = "持币防守" if t2_code == "CASH" else f"买入 {alloc_1m['t2']['lots']} 手 ({alloc_1m['t2']['shares']:,} 股, {alloc_1m['t2']['cost']:,.1f}元)"
+    t2_md_1k = f"防守持币 {alloc_1k['defensive_cash']:.1f}元" if t2_code == "CASH" else f"买入 {alloc_1k['t2']['lots']} 手 ({alloc_1k['t2']['shares']} 股, {alloc_1k['t2']['cost']:.1f}元)"
+    t2_md_5k = f"防守持币 {alloc_5k['defensive_cash']:.1f}元" if t2_code == "CASH" else f"买入 {alloc_5k['t2']['lots']} 手 ({alloc_5k['t2']['shares']} 股, {alloc_5k['t2']['cost']:.1f}元)"
+    t2_md_1m = f"防守持币 {alloc_1m['defensive_cash']:,.1f}元" if t2_code == "CASH" else f"买入 {alloc_1m['t2']['lots']} 手 ({alloc_1m['t2']['shares']:,} 股, {alloc_1m['t2']['cost']:,.1f}元)"
 
     markdown_text = f"""### 🚀 A股免五 ETF 轮动内参 ({as_of})
 > **市场状态**: {status_title}
@@ -734,15 +807,15 @@ def build_monitor_content(analysis):
 - **1,000 元方案**:
   · {t1_name}: 买入 {alloc_1k['t1']['lots']} 手 ({alloc_1k['t1']['shares']} 股, {alloc_1k['t1']['cost']:.1f}元)
   · {t2_name}: {t2_md_1k}
-  · 备用金: `{alloc_1k['cash_left']:.2f}` 元 | 利用率: `{alloc_1k['utilization_pct']:.1f}%`
+  · 零钱闲置: `{alloc_1k['cash_left']:.2f}` 元 | 规划率: `{alloc_1k['utilization_pct']:.1f}%`
 - **5,000 元方案**:
   · {t1_name}: 买入 {alloc_5k['t1']['lots']} 手 ({alloc_5k['t1']['shares']} 股, {alloc_5k['t1']['cost']:.1f}元)
   · {t2_name}: {t2_md_5k}
-  · 备用金: `{alloc_5k['cash_left']:.2f}` 元 | 利用率: `{alloc_5k['utilization_pct']:.1f}%`
+  · 零钱闲置: `{alloc_5k['cash_left']:.2f}` 元 | 规划率: `{alloc_5k['utilization_pct']:.1f}%`
 - **1,000,000 元大额方案**:
   · {t1_name}: 买入 {alloc_1m['t1']['lots']} 手 ({alloc_1m['t1']['shares']:,} 股, {alloc_1m['t1']['cost']:,.1f}元)
   · {t2_name}: {t2_md_1m}
-  · 备用金: `{alloc_1m['cash_left']:,.2f}` 元 | 利用率: `{alloc_1m['utilization_pct']:.2f}%`
+  · 零钱闲置: `{alloc_1m['cash_left']:,.2f}` 元 | 规划率: `{alloc_1m['utilization_pct']:.2f}%`
 
 ⚠️ **100万大额执行提醒**: 严禁市价单！请于 14:35~14:55 分 3-5 笔限价挂买一/卖一档委托，规避 0.3%~0.8% 的盘口冲击滑点。
 
@@ -790,6 +863,37 @@ def send_email(text_body, html_body, subject):
         return False
 
 
+def validate_webhook_response(platform_name, resp_text):
+    """校验 Webhook 响应报文中的业务级状态码，避免静默虚标成功"""
+    try:
+        data = json.loads(resp_text)
+        # 企业微信与钉钉: errcode == 0
+        if "errcode" in data:
+            if data["errcode"] == 0:
+                print(f"✅ {platform_name} Webhook 推送成功")
+                return True
+            else:
+                print(f"❌ {platform_name} Webhook 业务失败 (errcode={data['errcode']}): {data.get('errmsg', '')}")
+                return False
+        # 飞书机器人: code == 0
+        if "code" in data:
+            if data["code"] in (0, 200):
+                print(f"✅ {platform_name} Webhook 推送成功")
+                return True
+            else:
+                print(f"❌ {platform_name} Webhook 业务失败 (code={data['code']}): {data.get('msg', '')}")
+                return False
+        # PushPlus 微信推送: code == 200
+        if data.get("code") == 200 or data.get("status") == 200:
+            print(f"✅ {platform_name} 微信推送成功: {data.get('msg', '请求成功')}")
+            return True
+        print(f"ℹ️ {platform_name} Webhook 响应: {resp_text[:100]}")
+        return True
+    except Exception:
+        print(f"ℹ️ {platform_name} Webhook 响应: {resp_text[:100]}")
+        return True
+
+
 def send_webhook_notifications(subject, markdown_text, plain_text, html_body):
     """
     P1 优化项: 多通道 Webhook 即时推送
@@ -820,7 +924,7 @@ def send_webhook_notifications(subject, markdown_text, plain_text, html_body):
                 }
             }
             resp = http_post_json(wecom_url, payload)
-            print(f"✅ 企业微信 Webhook 推送成功: {resp[:100]}")
+            validate_webhook_response("企业微信", resp)
         except Exception as e:
             print(f"❌ 企业微信 Webhook 推送失败: {e}")
 
@@ -835,7 +939,7 @@ def send_webhook_notifications(subject, markdown_text, plain_text, html_body):
                 }
             }
             resp = http_post_json(dingtalk_url, payload)
-            print(f"✅ 钉钉 Webhook 推送成功: {resp[:100]}")
+            validate_webhook_response("钉钉", resp)
         except Exception as e:
             print(f"❌ 钉钉 Webhook 推送失败: {e}")
 
@@ -849,7 +953,7 @@ def send_webhook_notifications(subject, markdown_text, plain_text, html_body):
                 }
             }
             resp = http_post_json(feishu_url, payload)
-            print(f"✅ 飞书 Webhook 推送成功: {resp[:100]}")
+            validate_webhook_response("飞书", resp)
         except Exception as e:
             print(f"❌ 飞书 Webhook 推送失败: {e}")
 
@@ -864,7 +968,7 @@ def send_webhook_notifications(subject, markdown_text, plain_text, html_body):
                 "template": "html"
             }
             resp = http_post_json(url, payload)
-            print(f"✅ PushPlus 微信公众号推送成功: {resp[:100]}")
+            validate_webhook_response("PushPlus", resp)
         except Exception as e:
             print(f"❌ PushPlus 微信推送失败: {e}")
 
