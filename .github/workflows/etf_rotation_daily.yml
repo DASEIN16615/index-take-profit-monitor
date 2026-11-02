@@ -2,9 +2,11 @@ name: A-Share ETF Rotation Daily Monitor
 
 on:
   schedule:
-    # 每个工作日（周一至周五）北京时间 14:30 自动运行 (UTC 06:30)
-    # 为实操预留 20~25 分钟尾盘决策窗口
-    - cron: '30 6 * * 1-5'
+    # 避开 :30 拥堵高峰（GitHub Actions 免费池在 :00 和 :30 经常发生调度延迟或直接丢弃）
+    # 改为北京时间 14:28 (UTC 06:28) 错峰准时触发，为尾盘留出充分决策时间
+    - cron: '28 6 * * 1-5'
+    # 14:38 (UTC 06:38) 冗余防漏跑触发
+    - cron: '38 6 * * 1-5'
   workflow_dispatch:
     inputs:
       force_run:
