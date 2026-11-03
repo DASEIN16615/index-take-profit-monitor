@@ -2,6 +2,9 @@ name = "index-monitor-trigger"
 main = "src/index.js"
 compatibility_date = "2026-08-01"
 
-# 每日 UTC 01:00 = 北京时间 09:00
+[vars]
+REPO = "DASEIN16615/index-take-profit-monitor"
+
+# 工作日 09:00 (UTC 01:00) 晨报 + 14:28 (UTC 06:28) ETF 轮动内参
 [triggers]
-crons = ["0 1 * * *"]
+crons = ["0 1 * * 1-5", "28 6 * * 1-5"]
